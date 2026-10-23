@@ -31,10 +31,9 @@ The C streamripper works well, but the Rust port gains:
 | Relay server (`-r`/`-R`/`-z`/`-L`) | ✅ |
 | HLS (`.m3u8`): master→variant, poll + concatenate segments | ✅ |
 | FLAC: native → `.flac`, FLAC-in-Ogg → `.oga`, captured whole | ✅ |
-| `--wav` (decode mp3 → 16-bit PCM WAV, via vendored minimp3) | ✅ (mp3) |
-| Silence-based splitpoint (`--xs`, mp3) | ✅ |
+| `--wav` (decode → 16-bit PCM WAV): mp3 / aac / ogg-vorbis / flac | ✅ |
+| Silence-based splitpoint (`--xs`): mp3, aac | ✅ |
 | Ogg-Vorbis **per-track** splitting on Ogg boundaries | ⏳ (captured whole for now) |
-| `--wav`/silence for **aac/vorbis** | ⏳ (mp3 only) |
 | HLS AES-128 decryption | ⏳ (rejected, not silently corrupted) |
 | Accepted but currently no-ops: `-w`, `-E`, `-I`, `-c`, `--stderr`, `--debug`, `--codeset-*` | ⏳ |
 
@@ -47,9 +46,9 @@ Everything (URL/HTTP/ICY/args/output/relay/HLS) is hand-rolled on `std`. Only tw
 places take a dependency, where rolling your own would be reckless:
 
 - **TLS:** `rustls` (pure Rust, `ring` backend — no OpenSSL).
-- **MP3 decode** (for `--wav` + silence): the **vendored, public-domain
-  [minimp3](https://github.com/lieff/minimp3)** C header, compiled at build time
-  via `cc` — **no runtime crates added**. (It's the same decoder the C fork uses.)
+- **Audio decode** (for `--wav` + silence): **[symphonia](https://github.com/pdeljanov/Symphonia)**
+  (pure Rust) for mp3/aac/ogg-vorbis/flac. One crate replaces the C fork's
+  minimp3 + faad2 + libvorbis (three C libraries), with no C build step.
 
 ## Build
 
@@ -113,4 +112,4 @@ A port of **streamripper** by Jon Clegg and Gregory C. Sharp. Fork changes and
 this Rust port by **Jakub Kaprzyk**.
 
 Licensed under the **GNU General Public License, version 2** (GPL-2.0-only), the
-same as upstream streamripper. The vendored `minimp3` is public domain (CC0).
+same as upstream streamripper.

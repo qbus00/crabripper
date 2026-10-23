@@ -11,8 +11,8 @@ use crate::decode;
 
 /// Return the byte offset to cut at: the quietest decoded frame whose start lies
 /// within `[boundary - pre, boundary + post]`. Falls back to `boundary`.
-pub fn find_split(data: &[u8], boundary: usize, pre: usize, post: usize) -> usize {
-    let frames = decode::frame_volumes(data);
+pub fn find_split(data: &[u8], boundary: usize, pre: usize, post: usize, ext: &str) -> usize {
+    let frames = decode::frame_volumes(data, ext);
     if frames.len() < 2 {
         return boundary.min(data.len());
     }

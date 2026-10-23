@@ -18,10 +18,9 @@ path = "src/main.rs"
 # from macOS with no system libraries. Certificate verification is OFF by default
 # to mirror the C fork (opt-in verification is a planned flag).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-
-# Build-time only: compiles the vendored minimp3 (C). No runtime crates added.
-[build-dependencies]
-cc = "1"
+# Pure-Rust multi-codec decoder for --wav and silence detection. One crate
+# replaces the C fork's minimp3 + faad2 + libvorbis (three C libs). No C build.
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "flac", "vorbis", "ogg"] }
 
 [profile.release]
 opt-level = 3

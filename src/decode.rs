@@ -1,24 +1,13 @@
-//! MP3 decoding via the vendored minimp3 (C), used for `--wav` output and
-//! silence-based splitpoint detection. MP3 only — matching streamripper's
-//! "mp3 only" splitpoint/wav features.
+//! Audio decoding via symphonia (pure Rust): mp3, aac, ogg-vorbis, flac.
+//! Used for `--wav` (all formats) and silence-based splitpoint (mp3/aac).
 
-use std::os::raw::{c_int, c_void};
-
-extern "C" {
-    fn sr_mp3_new() -> *mut c_void;
-    fn sr_mp3_free(d: *mut c_void);
-    fn sr_mp3_decode(
-        d: *mut c_void,
-        buf: *const u8,
-        len: c_int,
-        pcm: *mut i16,
-        channels: *mut c_int,
-        hz: *mut c_int,
-        frame_bytes: *mut c_int,
-    ) -> c_int;
-}
-
-const MAX_SAMPLES_PER_FRAME: usize = 1152 * 2;
+use std::io::Cursor;
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::{Decoder, DecoderOptions};
+use symphonia::core::formats::{FormatOptions, FormatReader};
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 
 pub struct Pcm {
     pub samples: Vec<i16>, // interleaved
@@ -26,100 +15,97 @@ pub struct Pcm {
     pub sample_rate: u32,
 }
 
-/// Decode a complete MP3 byte buffer to interleaved 16-bit PCM.
-pub fn decode_mp3(data: &[u8]) -> Pcm {
-    let mut out: Vec<i16> = Vec::new();
-    let mut pcm = [0i16; MAX_SAMPLES_PER_FRAME];
-    let mut channels = 2i32;
-    let mut sample_rate = 44100i32;
-    let mut pos = 0usize;
-
-    unsafe {
-        let dec = sr_mp3_new();
-        if dec.is_null() {
-            return Pcm {
-                samples: out,
-                channels: 2,
-                sample_rate: 44100,
-            };
-        }
-        while pos < data.len() {
-            let mut c = 0i32;
-            let mut h = 0i32;
-            let mut fb = 0i32;
-            let got = sr_mp3_decode(
-                dec,
-                data[pos..].as_ptr(),
-                (data.len() - pos) as c_int,
-                pcm.as_mut_ptr(),
-                &mut c,
-                &mut h,
-                &mut fb,
-            );
-            if fb == 0 {
-                break; // need more data / end of stream
-            }
-            pos += fb as usize;
-            if got > 0 {
-                if c > 0 {
-                    channels = c;
-                }
-                if h > 0 {
-                    sample_rate = h;
-                }
-                let n = got as usize * channels.max(1) as usize;
-                out.extend_from_slice(&pcm[..n.min(pcm.len())]);
-            }
-        }
-        sr_mp3_free(dec);
-    }
-
-    Pcm {
-        samples: out,
-        channels: channels.max(1) as u16,
-        sample_rate: sample_rate.max(1) as u32,
+/// Map our output extension to a probe hint symphonia understands.
+fn hint_ext(ext: &str) -> &str {
+    match ext {
+        "oga" => "ogg",
+        other => other,
     }
 }
 
-/// For silence detection: `(byte offset of each frame's start, peak |sample|)`.
-pub fn frame_volumes(data: &[u8]) -> Vec<(usize, i32)> {
+type Opened = (Box<dyn FormatReader>, Box<dyn Decoder>, u32);
+
+fn open(data: &[u8], ext: &str) -> Option<Opened> {
+    let mss = MediaSourceStream::new(Box::new(Cursor::new(data.to_vec())), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension(hint_ext(ext));
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .ok()?;
+    let format = probed.format;
+    let track = format.default_track()?.clone();
+    let decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .ok()?;
+    Some((format, decoder, track.id))
+}
+
+/// Decode a complete audio buffer to interleaved 16-bit PCM.
+pub fn decode_audio(data: &[u8], ext: &str) -> Pcm {
+    let mut out: Vec<i16> = Vec::new();
+    let (mut channels, mut sample_rate) = (2u16, 44100u32);
+
+    if let Some((mut format, mut decoder, track_id)) = open(data, ext) {
+        let mut sbuf: Option<SampleBuffer<i16>> = None;
+        while let Ok(packet) = format.next_packet() {
+            if packet.track_id() != track_id {
+                continue;
+            }
+            if let Ok(audio) = decoder.decode(&packet) {
+                if sbuf.is_none() {
+                    let spec = *audio.spec();
+                    channels = spec.channels.count() as u16;
+                    sample_rate = spec.rate;
+                    sbuf = Some(SampleBuffer::new(audio.capacity() as u64, spec));
+                }
+                if let Some(sb) = &mut sbuf {
+                    sb.copy_interleaved_ref(audio);
+                    out.extend_from_slice(sb.samples());
+                }
+            }
+        }
+    }
+    Pcm {
+        samples: out,
+        channels,
+        sample_rate,
+    }
+}
+
+/// For silence detection (mp3/aac only — frame-contiguous codecs):
+/// `(cumulative byte offset of each frame, peak |sample| in that frame)`.
+pub fn frame_volumes(data: &[u8], ext: &str) -> Vec<(usize, i32)> {
     let mut frames = Vec::new();
-    let mut pcm = [0i16; MAX_SAMPLES_PER_FRAME];
-    let mut pos = 0usize;
-    unsafe {
-        let dec = sr_mp3_new();
-        if dec.is_null() {
-            return frames;
-        }
-        while pos < data.len() {
-            let mut c = 0i32;
-            let mut h = 0i32;
-            let mut fb = 0i32;
-            let got = sr_mp3_decode(
-                dec,
-                data[pos..].as_ptr(),
-                (data.len() - pos) as c_int,
-                pcm.as_mut_ptr(),
-                &mut c,
-                &mut h,
-                &mut fb,
-            );
-            if fb == 0 {
-                break;
+    if let Some((mut format, mut decoder, track_id)) = open(data, ext) {
+        let mut sbuf: Option<SampleBuffer<i16>> = None;
+        let mut byte_off = 0usize;
+        while let Ok(packet) = format.next_packet() {
+            if packet.track_id() != track_id {
+                continue;
             }
-            let frame_off = pos;
-            pos += fb as usize;
-            if got > 0 {
-                let n = (got as usize * c.max(1) as usize).min(pcm.len());
-                let peak = pcm[..n]
-                    .iter()
-                    .map(|s| (*s as i32).abs())
-                    .max()
-                    .unwrap_or(0);
-                frames.push((frame_off, peak));
+            let this_off = byte_off;
+            byte_off += packet.data.len();
+            if let Ok(audio) = decoder.decode(&packet) {
+                if sbuf.is_none() {
+                    sbuf = Some(SampleBuffer::new(audio.capacity() as u64, *audio.spec()));
+                }
+                if let Some(sb) = &mut sbuf {
+                    sb.copy_interleaved_ref(audio);
+                    let peak = sb
+                        .samples()
+                        .iter()
+                        .map(|s| (*s as i32).abs())
+                        .max()
+                        .unwrap_or(0);
+                    frames.push((this_off, peak));
+                }
             }
         }
-        sr_mp3_free(dec);
     }
     frames
 }

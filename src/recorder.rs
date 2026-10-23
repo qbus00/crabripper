@@ -86,14 +86,18 @@ impl Recorder {
         let incomplete = root.join("incomplete");
         fs::create_dir_all(&incomplete)?;
 
-        // --wav decodes to 16-bit PCM WAV; minimp3 is mp3-only here.
-        let wav = cfg.wav && ext == "mp3";
-        if cfg.wav && ext == "aac" {
-            eprintln!("  ! --wav supports mp3 only in this port; recording aac as-is");
+        // --wav decodes to 16-bit PCM WAV (symphonia: mp3/aac/ogg-vorbis/flac).
+        let wav = cfg.wav && matches!(ext, "mp3" | "aac" | "ogg" | "oga" | "flac");
+        if cfg.wav && !wav {
+            eprintln!("  ! --wav: cannot decode this stream type; recording as-is");
         }
 
-        // Silence-based splitpoint (mp3 only), on by default like streamripper.
-        let silence = ext == "mp3" && !cfg.no_individual && cfg.xs != Xs::None && !wav && !no_split;
+        // Silence-based splitpoint (mp3/aac — frame-contiguous), on by default.
+        let silence = matches!(ext, "mp3" | "aac")
+            && !cfg.no_individual
+            && cfg.xs != Xs::None
+            && !wav
+            && !no_split;
         let bpms = (bitrate_kbps.max(1) as usize / 8).max(1); // bytes per millisecond
         let (pre_ms, post_ms) = cfg.xs_search_window;
         let pre_ms = if pre_ms > 0 { pre_ms } else { 1500 };
@@ -272,7 +276,7 @@ impl Recorder {
         if self.wav {
             if let Some(t) = &self.cur {
                 if !t.raw.is_empty() {
-                    let _ = write_wav_file(&t.path, &t.raw);
+                    let _ = write_wav_file(&t.path, &t.raw, &self.ext);
                 }
             }
         }
@@ -302,7 +306,7 @@ impl Recorder {
         if self.wav {
             // Decode the buffered mp3 to a .wav at the incomplete path.
             if !prev.raw.is_empty() {
-                prev.bytes = write_wav_file(&prev.path, &prev.raw)?;
+                prev.bytes = write_wav_file(&prev.path, &prev.raw, &self.ext)?;
             }
         } else {
             // Append ID3v1 to mp3/aac tracks before closing, if requested.
@@ -362,8 +366,8 @@ impl Recorder {
         // A real boundary: cut the pending track at the quietest nearby frame.
         let boundary = (self.pend.len() as isize + self.xs_offset_bytes)
             .clamp(0, self.pend.len() as isize) as usize;
-        let cut =
-            split::find_split(&self.pend, boundary, self.xs_pre, self.xs_post).min(self.pend.len());
+        let cut = split::find_split(&self.pend, boundary, self.xs_pre, self.xs_post, &self.ext)
+            .min(self.pend.len());
 
         let prev_title = std::mem::take(&mut self.pend_title);
         let prev_proper = self.pend_proper;
@@ -467,8 +471,8 @@ impl Recorder {
 }
 
 /// Decode buffered mp3 bytes and write a .wav at `path`; returns the wav size.
-fn write_wav_file(path: &Path, raw: &[u8]) -> io::Result<u64> {
-    let pcm = decode::decode_mp3(raw);
+fn write_wav_file(path: &Path, raw: &[u8], ext: &str) -> io::Result<u64> {
+    let pcm = decode::decode_audio(raw, ext);
     let mut f = File::create(path)?;
     wav::write_wav(&mut f, &pcm.samples, pcm.channels, pcm.sample_rate)?;
     Ok(pcm.samples.len() as u64 * 2)

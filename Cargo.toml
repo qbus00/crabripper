@@ -1,5 +1,5 @@
 [package]
-name = "streamripper-rs"
+name = "crabripper"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
@@ -8,7 +8,7 @@ license = "GPL-2.0-only"
 authors = ["Jakub Kaprzyk"]
 
 [[bin]]
-name = "streamripper-rs"
+name = "crabripper"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,4 +1,4 @@
-# streamripper-rs
+# crabripper
 
 A **Rust port of [streamripper](https://github.com/qbus00/streamripper)** — records
 shoutcast/icecast radio streams to disk, split into per-track files, with a relay
@@ -72,9 +72,9 @@ Produces, from a Mac, with no Docker/QEMU:
 
 | Target | Binary |
 |---|---|
-| Apple Silicon macOS | `streamripper-rs-macos-arm64` |
-| x86-64 Linux (static musl) | `streamripper-rs-linux-amd64` |
-| aarch64 Linux (static musl) | `streamripper-rs-linux-arm64` |
+| Apple Silicon macOS | `crabripper-macos-arm64` |
+| x86-64 Linux (static musl) | `crabripper-linux-amd64` |
+| aarch64 Linux (static musl) | `crabripper-linux-arm64` |
 
 The Linux targets cross-compile via [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild)
 (zig supplies the C toolchain for minimp3). Install once: `brew install zig && cargo install cargo-zigbuild`,
@@ -83,7 +83,7 @@ plus `rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl`.
 ## Usage
 
 ```sh
-streamripper-rs URL [options]
+crabripper URL [options]
 ```
 
 Common options (run `-h` for the full streamripper-compatible list):
@@ -103,9 +103,9 @@ Common options (run `-h` for the full streamripper-compatible list):
 
 ```sh
 # examples
-streamripper-rs http://stream4.nadaje.com:9680/radiokrakow-s3 -d ~/rec -l 1h
-streamripper-rs https://ice1.somafm.com/indiepop-128-mp3 -r 8000 -u "WinampMPEG/5.0"
-streamripper-rs "https://example.com/live/playlist.m3u8" -a show.aac -l 2h
+crabripper http://stream4.nadaje.com:9680/radiokrakow-s3 -d ~/rec -l 1h
+crabripper https://ice1.somafm.com/indiepop-128-mp3 -r 8000 -u "WinampMPEG/5.0"
+crabripper "https://example.com/live/playlist.m3u8" -a show.aac -l 2h
 ```
 
 ## Credits & license

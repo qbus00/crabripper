@@ -1,4 +1,4 @@
-//! streamripper-rs — a work-in-progress Rust port of streamripper.
+//! crabripper — a work-in-progress Rust port of streamripper.
 //!
 //! Records shoutcast/icecast streams (HTTP/HTTPS) to per-track files, reading
 //! ICY inline metadata to split on track boundaries. Aims for CLI/behaviour

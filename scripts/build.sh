@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build streamripper-rs with a bit of ceremony: toolchain check, format check,
+# Build crabripper with a bit of ceremony: toolchain check, format check,
 # clippy, tests, then the actual build, and a report of the resulting binary.
 #
 # Usage:
@@ -121,7 +121,7 @@ ui_run build "Compiling ($PROFILE)" "$CARGO" "$CARGO_SUB" ${BUILD_FLAGS[@]+"${BU
   || ui_die "build failed (see above)"
 
 # --- report ---
-BIN="$OUT_DIR/streamripper-rs"
+BIN="$OUT_DIR/crabripper"
 if [[ -f "$BIN" ]]; then
   SIZE="$(du -h "$BIN" | awk '{print $1}')"
   ui_ok "binary: $BIN  ($SIZE)"
@@ -129,7 +129,7 @@ else
   ui_warn "expected binary not found at $BIN"
 fi
 
-ui_done "streamripper-rs $VERSION" "$PROFILE build"
+ui_done "crabripper $VERSION" "$PROFILE build"
 
 # --- optional run ---
 if [[ "$DO_RUN" == 1 ]]; then

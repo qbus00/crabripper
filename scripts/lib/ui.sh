@@ -1,12 +1,12 @@
-# Shared terminal presentation for streamripper-rs scripts.
+# Shared terminal presentation for crabripper scripts.
 # Sourced, not run. Style ported from QRadio/QAudioEditor's scripts/lib/ui.sh.
 #
 #   ui_banner "rust port" "release  |  aarch64-apple-darwin"
 #   ui_section "Checks"
 #   ui_step   "Formatting check"
 #   ui_run    build "Building (release)" cargo build --release   # spinner, log, report
-#   ui_ok     "binary: target/release/streamripper-rs (1.8 MB)"
-#   ui_done   "streamripper-rs 0.1.0"
+#   ui_ok     "binary: target/release/crabripper (1.8 MB)"
+#   ui_done   "crabripper 0.1.0"
 #
 # ui_run runs a command with its output going to one reused log in the system
 # temp dir, while the terminal shows a single redrawn line: a spinner, elapsed
@@ -34,18 +34,18 @@ fi
 ui_banner() {
   if [[ "${SR_UI_NESTED:-0}" == 1 ]]; then return 0; fi
   if [[ "$UI_TTY" != 1 ]]; then
-    printf '== streamripper-rs %s ==\n' "$1"
+    printf '== crabripper %s ==\n' "$1"
     [[ -n "${2:-}" ]] && printf '%s\n' "$2"
     return 0
   fi
   printf '%s' "$UI_CYAN$UI_BOLD"
   cat <<'ART'
-     _                                 _
- ___| |_ _ __ ___  __ _ _ __ ___  _ __(_)_ __  _ __   ___ _ __
-/ __| __| '__/ _ \/ _` | '_ ` _ \| '__| | '_ \| '_ \ / _ \ '__|
-\__ \ |_| | |  __/ (_| | | | | | | |  | | |_) | |_) |  __/ |
-|___/\__|_|  \___|\__,_|_| |_| |_|_|  |_| .__/| .__/ \___|_|
-                                        |_|   |_|
+                _          _
+  ___ _ __ __ _| |__  _ __(_)_ __  _ __   ___ _ __
+ / __| '__/ _` | '_ \| '__| | '_ \| '_ \ / _ \ '__|
+| (__| | | (_| | |_) | |  | | |_) | |_) |  __/ |
+ \___|_|  \__,_|_.__/|_|  |_| .__/| .__/ \___|_|
+                            |_|   |_|
 ART
   printf '  %s%s\n' "$1" "$UI_RESET"
   [[ -n "${2:-}" ]] && printf '  %s%s%s\n' "$UI_DIM" "$2" "$UI_RESET"
@@ -60,7 +60,7 @@ ui_warn()    { printf '  %s!%s %s\n' "$UI_YELLOW" "$UI_RESET" "$1" >&2; }
 ui_err()     { printf '  %sx%s %s\n' "$UI_RED" "$UI_RESET" "$1" >&2; }
 ui_die()     { ui_err "$1"; exit 1; }
 
-# ui_done "streamripper-rs 0.1.0" ["extra note"]
+# ui_done "crabripper 0.1.0" ["extra note"]
 ui_done() {
   printf '\n  %s%sDone:%s %s' "$UI_GREEN" "$UI_BOLD" "$UI_RESET" "$1"
   [[ -n "${2:-}" ]] && printf ', %s' "$2"

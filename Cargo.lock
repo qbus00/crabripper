@@ -100,6 +100,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "crabripper"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "cbc",
+ "encoding_rs",
+ "regex",
+ "rustls",
+ "socket2",
+ "symphonia",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -305,19 +318,6 @@ checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
 dependencies = [
  "libc",
  "windows-sys",
-]
-
-[[package]]
-name = "streamripper-rs"
-version = "0.1.0"
-dependencies = [
- "aes",
- "cbc",
- "encoding_rs",
- "regex",
- "rustls",
- "socket2",
- "symphonia",
 ]
 
 [[package]]

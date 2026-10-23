@@ -128,7 +128,7 @@ impl Default for Config {
             length: None,
             max_megabytes: None,
             no_reconnect: false,
-            user_agent: "Streamripper/1.x".to_string(),
+            user_agent: "crabripper/0.1".to_string(),
             timeout: 15,
             proxy: None,
             interface: None,
@@ -197,7 +197,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
                 return Ok(Parsed::Exit(0));
             }
             "-v" | "-V" | "--version" => {
-                println!("streamripper-rs {VERSION}");
+                println!("crabripper {VERSION}");
                 return Ok(Parsed::Exit(0));
             }
             "-a" => {
@@ -397,7 +397,7 @@ pub fn parse_length(s: &str) -> Result<u64, String> {
 
 pub fn print_usage() {
     let u = "\
-Usage: streamripper-rs URL [OPTIONS]   (Rust port; aims for streamripper CLI parity)
+Usage: crabripper URL [OPTIONS]   (Rust port; aims for streamripper CLI parity)
 Opts: -h             - Print this listing
       -v             - Print version info and quit
       -a [file]      - Rip to single file, default name is timestamped
@@ -417,7 +417,7 @@ Opts: -h             - Print this listing
                        or hh:mm[:ss] (1:30 or 1:30:00); else runs forever
       -M megabytes   - Stop ripping after this many megabytes
       -q [start]     - Add sequence number to output file
-      -u useragent   - Use a different UserAgent than \"Streamripper\"
+      -u useragent   - Use a different UserAgent than \"crabripper\"
       -w rulefile    - Parse metadata using rules in file
       -m timeout     - Seconds before force-closing a stalled connection
       -k count       - Leave <count> tracks in incomplete
@@ -452,7 +452,7 @@ mod tests {
     use super::*;
 
     fn cfg(args: &[&str]) -> Config {
-        let mut v = vec!["streamripper-rs".to_string()];
+        let mut v = vec!["crabripper".to_string()];
         v.extend(args.iter().map(|s| s.to_string()));
         match parse(v).unwrap() {
             Parsed::Run(c) => *c,

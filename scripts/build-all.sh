@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# Build streamripper-rs for all three release architectures — the same set the C
+# Build crabripper for all three release architectures — the same set the C
 # streamripper fork ships — into dist/:
-#   dist/streamripper-rs-macos-arm64   (aarch64-apple-darwin, native)
-#   dist/streamripper-rs-linux-amd64   (x86_64-unknown-linux-musl, fully static)
-#   dist/streamripper-rs-linux-arm64   (aarch64-unknown-linux-musl, fully static)
+#   dist/crabripper-macos-arm64   (aarch64-apple-darwin, native)
+#   dist/crabripper-linux-amd64   (x86_64-unknown-linux-musl, fully static)
+#   dist/crabripper-linux-arm64   (aarch64-unknown-linux-musl, fully static)
 #
 # The Linux targets cross-compile from macOS via cargo-zigbuild (zig supplies the
 # C toolchain that ring needs), producing fully-static binaries with no Docker,
@@ -76,8 +76,8 @@ while IFS='|' read -r triple label method; do
   fi
 
   if ui_run "build-$label" "Compiling $label (release)" "$CARGO" "$sub" --release --target "$triple"; then
-    out="dist/streamripper-rs-$label"
-    cp "target/$triple/release/streamripper-rs" "$out"
+    out="dist/crabripper-$label"
+    cp "target/$triple/release/crabripper" "$out"
     ui_ok "$out  ($(du -h "$out" | awk '{print $1}'))"
     if [[ "$GZIP" == 1 ]]; then gzip -kf "$out"; ui_info "gzipped: $out.gz"; fi
     built=$((built + 1))
@@ -86,4 +86,4 @@ done <<EOF
 $TARGETS
 EOF
 
-ui_done "streamripper-rs $VERSION" "$built/3 targets -> dist/"
+ui_done "crabripper $VERSION" "$built/3 targets -> dist/"

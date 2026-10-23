@@ -79,7 +79,7 @@ impl Recorder {
         if !cfg.no_subdir {
             let base = sanitize(stream_name);
             let base = if base.is_empty() {
-                "Streamripper_rips".to_string()
+                "Crabripper_rips".to_string()
             } else {
                 base
             };

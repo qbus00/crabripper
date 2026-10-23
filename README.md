@@ -55,6 +55,24 @@ places take a dependency, where rolling your own would be reckless:
   (pure Rust) for mp3/aac/ogg-vorbis/flac. One crate replaces the C fork's
   minimp3 + faad2 + libvorbis (three C libraries), with no C build step.
 
+## Install
+
+### Homebrew (macOS / Linuxbrew)
+
+```sh
+brew install qbus00/crabripper/crabripper
+```
+
+Builds from source with the Rust toolchain (pulled in automatically as a
+build-only dependency), so it works on Apple Silicon and Intel macOS and on
+Linuxbrew. Upgrade with `brew upgrade crabripper`; track `main` with
+`brew install --HEAD qbus00/crabripper/crabripper`.
+
+### Prebuilt binaries
+
+Each [release](https://github.com/qbus00/crabripper/releases) ships static Linux
+(musl) and Apple Silicon macOS binaries — download, `gunzip`, `chmod +x`, done.
+
 ## Build
 
 Needs a Rust toolchain (`rustup`). The build script runs fmt + clippy + tests
@@ -80,7 +98,7 @@ Produces, from a Mac, with no Docker/QEMU:
 | aarch64 Linux (static musl) | `crabripper-linux-arm64` |
 
 The Linux targets cross-compile via [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild)
-(zig supplies the C toolchain for minimp3). Install once: `brew install zig && cargo install cargo-zigbuild`,
+(zig supplies the linker for the static musl target). Install once: `brew install zig && cargo install cargo-zigbuild`,
 plus `rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl`.
 
 ## Usage

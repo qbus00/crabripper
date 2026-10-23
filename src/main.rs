@@ -250,6 +250,9 @@ fn rip_stream(
             *total += audio.len() as u64;
             for ev in splitter.push(&audio) {
                 if let Some(title) = ev.title {
+                    if let Some(r) = relay {
+                        r.set_title(&title);
+                    }
                     rec.roll_track(&title).map_err(|e| e.to_string())?;
                 }
                 rec.write_audio(&ev.bytes).map_err(|e| e.to_string())?;
@@ -275,7 +278,7 @@ fn rip_stream(
             if let Some(r) = relay {
                 r.broadcast(&audio);
             }
-            drain_external(ext_meta, cfg, rec)?;
+            drain_external(ext_meta, cfg, rec, relay)?;
             let len_byte = match src.read_byte().map_err(|e| e.to_string())? {
                 Some(b) => b,
                 None => return Ok(StopReason::Disconnected),
@@ -294,6 +297,9 @@ fn rip_stream(
                         let title = codeset::decode(raw, cfg.codeset_metadata.as_deref());
                         let title = cfg.rules.apply(&title);
                         if !title.is_empty() {
+                            if let Some(r) = relay {
+                                r.set_title(&title);
+                            }
                             rec.on_title(&title).map_err(|e| e.to_string())?;
                         }
                     }
@@ -314,7 +320,7 @@ fn rip_stream(
             if let Some(r) = relay {
                 r.broadcast(&audio);
             }
-            drain_external(ext_meta, cfg, rec)?;
+            drain_external(ext_meta, cfg, rec, relay)?;
         }
     }
 }
@@ -324,11 +330,15 @@ fn drain_external(
     ext_meta: Option<&std::sync::mpsc::Receiver<String>>,
     cfg: &Config,
     rec: &mut recorder::Recorder,
+    relay: &Option<relay::Relay>,
 ) -> Result<(), String> {
     if let Some(rx) = ext_meta {
         while let Ok(t) = rx.try_recv() {
             let t = cfg.rules.apply(&t);
             if !t.is_empty() {
+                if let Some(r) = relay {
+                    r.set_title(&t);
+                }
                 rec.on_title(&t).map_err(|e| e.to_string())?;
             }
         }

@@ -22,8 +22,8 @@ pub fn fetch(url_str: &str, cfg: &Config) -> Result<Fetch, String> {
     let mut current = url_str.to_string();
     for _ in 0..MAX_REDIRECTS {
         let u = url::parse(&current)?;
-        let mut c =
-            conn::connect(&u, timeout, cfg.interface.as_deref()).map_err(|e| e.to_string())?;
+        let mut c = conn::connect(&u, timeout, cfg.interface.as_deref(), cfg.ssl_verify)
+            .map_err(|e| e.to_string())?;
         let request = format!(
             "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
             u.path, u.host, cfg.user_agent
@@ -83,14 +83,8 @@ pub fn open_stream(url_str: &str, cfg: &Config) -> Result<(Conn, StreamInfo, Vec
 
     for _ in 0..MAX_REDIRECTS {
         let u = url::parse(&current)?;
-        if u.tls && cfg.ssl_verify {
-            eprintln!(
-                "  ! --ssl-verify requested but certificate verification is not yet \
-                 enforced in this port (connection is still encrypted); treating as off"
-            );
-        }
-        let mut c =
-            conn::connect(&u, timeout, cfg.interface.as_deref()).map_err(|e| e.to_string())?;
+        let mut c = conn::connect(&u, timeout, cfg.interface.as_deref(), cfg.ssl_verify)
+            .map_err(|e| e.to_string())?;
 
         let version = if cfg.http10 { "1.0" } else { "1.1" };
         let request = format!(

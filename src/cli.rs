@@ -103,6 +103,12 @@ pub struct Config {
     pub to_stderr: bool,
     pub debug: bool,
 
+    // crabripper extensions
+    pub log: bool,               // --log: write a played.log of track titles
+    pub split_time: Option<u64>, // --split-time=SECS: force a new track every N s
+    pub split_size: Option<u64>, // --split-size=MB: force a new track every N MB
+    pub config: Option<String>,  // -C / --config=FILE
+
     // codeset (accepted; conversion is a planned enhancement)
     pub codeset_filesys: Option<String>,
     pub codeset_id3: Option<String>,
@@ -157,6 +163,10 @@ impl Default for Config {
             quiet: false,
             to_stderr: false,
             debug: false,
+            log: false,
+            split_time: None,
+            split_size: None,
+            config: None,
             codeset_filesys: None,
             codeset_id3: None,
             codeset_metadata: None,
@@ -177,6 +187,30 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     // drop argv[0] if it looks like the program name (callers pass env::args)
     if !argv.is_empty() {
         argv.remove(0);
+    }
+
+    // -C / --config=FILE: splice the file's tokens in front of the CLI args, so
+    // the command line overrides the config file. Lines are whitespace-split;
+    // '#' comments and blank lines are ignored (no quoting).
+    let cfg_path = argv.iter().enumerate().find_map(|(i, a)| {
+        if a == "-C" {
+            argv.get(i + 1).cloned()
+        } else {
+            a.strip_prefix("--config=").map(str::to_string)
+        }
+    });
+    if let Some(path) = cfg_path {
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("-C {path}: {e}"))?;
+        let mut tokens: Vec<String> = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            tokens.extend(line.split_whitespace().map(str::to_string));
+        }
+        tokens.append(&mut argv);
+        argv = tokens;
     }
 
     let mut i = 0;
@@ -255,6 +289,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             "--quiet" => c.quiet = true,
             "--stderr" => c.to_stderr = true,
             "--debug" => c.debug = true,
+            "--log" => c.log = true,
+            "-C" => c.config = Some(next(&mut i, "-C")?),
             "--http10" => c.http10 = true,
             "--hls" => c.hls_mode = HlsMode::Force,
             "--no-hls" => c.hls_mode = HlsMode::Off,
@@ -286,6 +322,12 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
                     c.codeset_metadata = Some(v.to_string());
                 } else if let Some(v) = a.strip_prefix("--codeset-relay=") {
                     c.codeset_relay = Some(v.to_string());
+                } else if let Some(v) = a.strip_prefix("--split-time=") {
+                    c.split_time = Some(parse_length(v)?);
+                } else if let Some(v) = a.strip_prefix("--split-size=") {
+                    c.split_size = Some(parse_u64(v, "--split-size")?);
+                } else if let Some(v) = a.strip_prefix("--config=") {
+                    c.config = Some(v.to_string());
                 } else if a.starts_with('-') && a != "-" {
                     return Err(format!("unknown option: {a}"));
                 } else if !url_set {
@@ -443,7 +485,12 @@ Splitpoint opts (mp3):
       --xs-offset=num  --xs-padding=num:num
       --xs-search-window=num:num  --xs-silence-length=num
 Codeset opts:
-      --codeset-filesys= / --codeset-id3= / --codeset-metadata= / --codeset-relay=";
+      --codeset-filesys= / --codeset-id3= / --codeset-metadata= / --codeset-relay=
+crabripper extensions:
+      --log            - Write a timestamped played.log of track titles
+      --split-time=SECS - Force a new track every N seconds (or 90s/12m/2h)
+      --split-size=MB  - Force a new track every N megabytes
+      -C file / --config=file - Read options from a file (CLI overrides it)";
     eprintln!("{u}");
 }
 

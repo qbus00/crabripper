@@ -141,7 +141,9 @@ fn reassemble(p: &mut Pending, page: &PageInfo, page_bytes: &[u8]) {
         }
         off += seg;
         if seg < 255 {
-            if p.title.is_none() && p.packet.starts_with(b"\x03vorbis") {
+            if p.title.is_none()
+                && (p.packet.starts_with(b"\x03vorbis") || p.packet.starts_with(b"OpusTags"))
+            {
                 p.title = Some(parse_vorbis_comment(&p.packet));
             }
             p.packets_done += 1;
@@ -150,10 +152,15 @@ fn reassemble(p: &mut Pending, page: &PageInfo, page_bytes: &[u8]) {
     }
 }
 
-/// Extract "Artist - Title" (or just title) from a Vorbis comment packet.
+/// Extract "Artist - Title" (or just title) from a Vorbis/Opus comment packet.
 fn parse_vorbis_comment(packet: &[u8]) -> String {
-    // layout: [0x03]"vorbis" | vendor_len(u32) vendor | count(u32) | (len(u32) "KEY=val")*
-    let mut pos = 7;
+    // layout: <magic> | vendor_len(u32) vendor | count(u32) | (len(u32) "KEY=val")*
+    // magic is "\x03vorbis" (7 bytes) for Vorbis, "OpusTags" (8 bytes) for Opus.
+    let mut pos = if packet.starts_with(b"OpusTags") {
+        8
+    } else {
+        7
+    };
     let rd = |b: &[u8], p: usize| -> Option<u32> {
         if p + 4 <= b.len() {
             Some(u32::from_le_bytes([b[p], b[p + 1], b[p + 2], b[p + 3]]))

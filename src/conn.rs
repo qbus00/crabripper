@@ -127,7 +127,7 @@ impl ServerCertVerifier for NoVerify {
 /// `timeout` is applied to both the connect and subsequent reads. `bind` (`-I`)
 /// optionally binds the outgoing socket to a local IP, or on Linux an interface
 /// name (SO_BINDTODEVICE).
-pub fn connect(url: &Url, timeout: Duration, bind: Option<&str>) -> io::Result<Conn> {
+pub fn connect(url: &Url, timeout: Duration, bind: Option<&str>, verify: bool) -> io::Result<Conn> {
     let addr = (url.host.as_str(), url.port)
         .to_socket_addrs()?
         .next()
@@ -145,16 +145,25 @@ pub fn connect(url: &Url, timeout: Duration, bind: Option<&str>) -> io::Result<C
     }
 
     let provider = Arc::new(ring::default_provider());
-    let schemes = provider
-        .signature_verification_algorithms
-        .supported_schemes();
-
-    let config = ClientConfig::builder_with_provider(provider)
+    let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
-        .map_err(other)?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify { schemes }))
-        .with_no_client_auth();
+        .map_err(other)?;
+
+    // --ssl-verify: real certificate + hostname verification against the Mozilla
+    // root store. Off by default (encrypted but unauthenticated, like the C fork).
+    let config = if verify {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        builder.with_root_certificates(roots).with_no_client_auth()
+    } else {
+        let schemes = provider
+            .signature_verification_algorithms
+            .supported_schemes();
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify { schemes }))
+            .with_no_client_auth()
+    };
 
     let server_name = ServerName::try_from(url.host.clone())
         .map_err(|_| other(format!("invalid TLS server name: {}", url.host)))?;

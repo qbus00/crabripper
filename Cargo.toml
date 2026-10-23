@@ -28,6 +28,7 @@ cbc = { version = "0.1", features = ["alloc"] }
 encoding_rs = "0.8"  # --codeset-* charset conversion (e.g. CP1250 Polish metadata)
 regex = "1"          # -w metadata rulefiles
 socket2 = { version = "0.5", features = ["all"] }  # -I bind to interface/local IP (bind_device needs "all")
+webpki-roots = "0.26"  # Mozilla root certs for --ssl-verify (data only, no code)
 
 [profile.release]
 opt-level = 3

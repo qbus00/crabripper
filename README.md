@@ -28,16 +28,19 @@ The C streamripper works well, but the Rust port gains:
 | Length forms: seconds / `90s`/`12m`/`2h` / `hh:mm[:ss]`, size limit (`-M`) | ✅ |
 | ID3 tags (v2.3 prepended, v1 appended; UTF-16 so Polish survives) | ✅ |
 | Cue sheets for single-file recordings | ✅ |
-| Relay server (`-r`/`-R`/`-z`/`-L`) | ✅ |
+| Relay server (`-r`/`-R`/`-z`/`-L`) **with ICY metadata injection** (players show titles) | ✅ |
 | HLS (`.m3u8`): master→variant, poll + concatenate segments | ✅ |
 | FLAC: native → `.flac`, FLAC-in-Ogg → `.oga`, captured whole | ✅ |
+| **Ogg Opus**: per-track split + `OpusTags` titles (capture; decode via symphonia n/a) | ✅ |
 | `--wav` (decode → 16-bit PCM WAV): mp3 / aac / ogg-vorbis / flac | ✅ |
 | Silence-based splitpoint (`--xs`): mp3, aac | ✅ |
-| Ogg-Vorbis **per-track** splitting (on Ogg logical-stream boundaries) | ✅ |
+| Ogg per-track splitting (on Ogg logical-stream boundaries) | ✅ |
 | HLS AES-128 decryption (`#EXT-X-KEY`) | ✅ |
 | Auto-reconnect on stream drop (`-c` to disable) | ✅ |
 | Metadata rulefiles (`-w`), external metadata (`-E`), interface bind (`-I`) | ✅ |
 | Charset conversion (`--codeset-metadata`/`-id3`/`-filesys`), `--debug`, `--stderr` | ✅ |
+| **`--ssl-verify`** enforced (real cert check, Mozilla roots) | ✅ |
+| **Extras:** `--log` (played.log), `--split-time`/`--split-size`, `-C`/`--config`, `-T` | ✅ |
 
 Verified live against real stations (Polish public radio over http/https, SomaFM,
 Radio Paradise FLAC, HLS) on both macOS and a static Linux build on a Synology NAS.

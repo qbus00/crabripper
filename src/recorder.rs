@@ -12,9 +12,10 @@
 use crate::cli::{Config, Overwrite, Xs};
 use crate::util::{now_stamp, sanitize};
 use crate::{cue, decode, id3, split, wav};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 struct Track {
     title: String,
@@ -43,6 +44,13 @@ pub struct Recorder {
     without_id3v2: bool,
     codeset_id3: Option<String>,
     codeset_filesys: Option<String>,
+
+    // crabripper extensions
+    truncate_dup: bool,
+    log_path: Option<PathBuf>,
+    split_time: Option<Duration>,
+    split_size: Option<u64>,
+    cur_start: Instant,
 
     show: Option<File>,
     show_path: Option<PathBuf>,
@@ -87,6 +95,11 @@ impl Recorder {
         }
         let incomplete = root.join("incomplete");
         fs::create_dir_all(&incomplete)?;
+        let log_path = if cfg.log {
+            Some(root.join("played.log"))
+        } else {
+            None
+        };
 
         // --wav decodes to 16-bit PCM WAV (symphonia: mp3/aac/ogg-vorbis/flac).
         let wav = cfg.wav && matches!(ext, "mp3" | "aac" | "ogg" | "oga" | "flac");
@@ -138,6 +151,11 @@ impl Recorder {
             without_id3v2: cfg.without_id3v2,
             codeset_id3: cfg.codeset_id3.clone(),
             codeset_filesys: cfg.codeset_filesys.clone(),
+            truncate_dup: cfg.truncate_dup,
+            log_path,
+            split_time: cfg.split_time.map(Duration::from_secs),
+            split_size: cfg.split_size.map(|mb| mb * 1024 * 1024),
+            cur_start: Instant::now(),
             show,
             show_path,
             show_bytes: 0,
@@ -182,6 +200,7 @@ impl Recorder {
     /// the Ogg path (every logical-stream boundary is a real new track, even if
     /// two consecutive tracks share a title).
     pub fn roll_track(&mut self, title: &str) -> io::Result<()> {
+        self.note_title(title);
         if let Some(prev) = self.cur.take() {
             self.finalize(prev)?;
         }
@@ -213,10 +232,10 @@ impl Recorder {
                 base
             };
             let tx = self.track_ext();
-            let path = self.incomplete.join(fs_component(
+            let path = self.dedup_path(self.incomplete.join(fs_component(
                 format!("{base}.{tx}"),
                 self.codeset_filesys.as_deref(),
-            ));
+            )));
             let mut bytes = 0u64;
             let file = if self.wav {
                 None // buffered as mp3, decoded to wav at finalize
@@ -258,6 +277,7 @@ impl Recorder {
                 self.on_title("")?;
             }
             let wav = self.wav;
+            let mut cur_bytes = 0u64;
             if let Some(t) = &mut self.cur {
                 if wav {
                     t.raw.extend_from_slice(data);
@@ -266,6 +286,12 @@ impl Recorder {
                     f.write_all(data)?;
                     t.bytes += data.len() as u64;
                 }
+                cur_bytes = t.bytes;
+            }
+            // --split-time / --split-size: force a new track (not for ogg/wav,
+            // which have their own boundaries).
+            if !wav && self.ext != "ogg" && self.should_split(cur_bytes) {
+                self.roll_track("")?;
             }
         }
         Ok(())
@@ -372,9 +398,53 @@ impl Recorder {
         Ok(())
     }
 
+    // ---- crabripper extensions ----
+
+    /// Reset the per-track clock and, with --log, append the title to played.log.
+    fn note_title(&mut self, title: &str) {
+        self.cur_start = Instant::now();
+        if let Some(p) = &self.log_path {
+            if !title.is_empty() {
+                if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(p) {
+                    let _ = writeln!(f, "{}  {}", now_stamp(), title);
+                }
+            }
+        }
+    }
+
+    /// Without -T, avoid clobbering an existing incomplete file by versioning it.
+    fn dedup_path(&self, path: PathBuf) -> PathBuf {
+        if self.truncate_dup || !path.exists() {
+            return path;
+        }
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        for n in 1..10_000 {
+            let name = if ext.is_empty() {
+                format!("{stem} ({n})")
+            } else {
+                format!("{stem} ({n}).{ext}")
+            };
+            let cand = dir.join(name);
+            if !cand.exists() {
+                return cand;
+            }
+        }
+        path
+    }
+
+    /// --split-time / --split-size: has the current track hit a forced boundary?
+    fn should_split(&self, cur_bytes: u64) -> bool {
+        self.split_time
+            .is_some_and(|d| self.cur_start.elapsed() >= d)
+            || self.split_size.is_some_and(|sz| cur_bytes >= sz)
+    }
+
     // ---- silence-based splitpoint path (mp3) ----
 
     fn handle_silence_title(&mut self, title: &str) -> io::Result<()> {
+        self.note_title(title);
         if !self.pend_started {
             // First title: the audio buffered so far is this (partial) first track.
             self.seen += 1;
@@ -413,10 +483,10 @@ impl Recorder {
                 b
             }
         };
-        let path = self.incomplete.join(fs_component(
+        let path = self.dedup_path(self.incomplete.join(fs_component(
             format!("{base}.{}", self.ext),
             self.codeset_filesys.as_deref(),
-        ));
+        )));
         let mut f = File::create(&path)?;
         let mut bytes = 0u64;
         if self.mp3like && !self.no_id3 && !self.without_id3v2 {

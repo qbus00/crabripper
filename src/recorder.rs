@@ -6,9 +6,11 @@
 //! - overwrite modes (`-o`), single-file show (`-a`), no-individual (`-A`),
 //!   keep-incomplete (`-k`), sequence numbers (`-q`), name patterns (`-D`).
 //!
-//! Cue sheets and ID3 tags are added in later increments.
+//! ID3 tags (v2.3 prepended to mp3/aac tracks, optional v1 appended) and cue
+//! sheets for single-file (`-a`) recordings are written here too.
 
 use crate::cli::{Config, Overwrite};
+use crate::{cue, id3};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -26,21 +28,32 @@ pub struct Recorder {
     root: PathBuf,
     incomplete: PathBuf,
     ext: String,
+    mp3like: bool,
     no_individual: bool,
     overwrite: Overwrite,
     pattern: Option<String>,
     seq: Option<u32>,
     keep_incomplete: u32,
 
-    cur: Option<Track>,
+    no_id3: bool,
+    with_id3v1: bool,
+    without_id3v2: bool,
+
     show: Option<File>,
+    show_path: Option<PathBuf>,
+    show_bytes: u64,
+    bitrate_kbps: u32,
+    no_cue: bool,
+    cue_entries: Vec<(String, u64)>,
+
+    cur: Option<Track>,
     completed: u32,
     seen: u32,
     kept: u32,
 }
 
 impl Recorder {
-    pub fn new(cfg: &Config, stream_name: &str, ext: &str) -> io::Result<Self> {
+    pub fn new(cfg: &Config, stream_name: &str, ext: &str, bitrate_kbps: u32) -> io::Result<Self> {
         let mut root = PathBuf::from(cfg.output_dir.clone().unwrap_or_else(|| ".".to_string()));
         if !cfg.no_subdir {
             let base = sanitize(stream_name);
@@ -54,7 +67,7 @@ impl Recorder {
         let incomplete = root.join("incomplete");
         fs::create_dir_all(&incomplete)?;
 
-        let show = if cfg.single_file {
+        let (show, show_path) = if cfg.single_file {
             let name = match &cfg.single_file_name {
                 Some(n) if n.contains('.') => n.clone(),
                 Some(n) => format!("{n}.{ext}"),
@@ -62,22 +75,31 @@ impl Recorder {
             };
             let path = root.join(sanitize(&name));
             eprintln!("[show file] {}", path.display());
-            Some(File::create(path)?)
+            (Some(File::create(&path)?), Some(path))
         } else {
-            None
+            (None, None)
         };
 
         Ok(Recorder {
             root,
             incomplete,
             ext: ext.to_string(),
+            mp3like: matches!(ext, "mp3" | "aac"),
             no_individual: cfg.no_individual,
             overwrite: cfg.overwrite,
             pattern: cfg.pattern.clone(),
             seq: cfg.seq,
             keep_incomplete: cfg.keep_incomplete.unwrap_or(0),
-            cur: None,
+            no_id3: cfg.no_id3,
+            with_id3v1: cfg.with_id3v1,
+            without_id3v2: cfg.without_id3v2,
             show,
+            show_path,
+            show_bytes: 0,
+            bitrate_kbps: bitrate_kbps.max(1),
+            no_cue: cfg.no_cue,
+            cue_entries: Vec::new(),
+            cur: None,
             completed: 0,
             seen: 0,
             kept: 0,
@@ -99,8 +121,15 @@ impl Recorder {
         self.seen += 1;
         let proper_start = self.seen > 1;
 
+        // Cue entry for the single-file show: this track starts at the current
+        // position in the show file.
+        if self.show.is_some() && !self.no_cue && !title.is_empty() {
+            let sec = self.show_bytes * 8 / (self.bitrate_kbps as u64 * 1000);
+            self.cue_entries.push((title.to_string(), sec));
+        }
+
         if self.no_individual {
-            // still track boundaries (for the show file / future cue sheet)
+            // still track boundaries (for the show file / cue sheet)
             self.cur = Some(Track {
                 title: title.to_string(),
                 path: PathBuf::new(),
@@ -116,13 +145,21 @@ impl Recorder {
                 base
             };
             let path = self.incomplete.join(format!("{base}.{}", self.ext));
-            let f = File::create(&path)?;
+            let mut f = File::create(&path)?;
+            let mut bytes = 0u64;
+            // Prepend ID3v2.3 to mp3/aac tracks (default on).
+            if self.mp3like && !self.no_id3 && !self.without_id3v2 {
+                let (artist, song) = id3::split_artist_title(title);
+                let tag = id3::id3v2(artist, song);
+                f.write_all(&tag)?;
+                bytes += tag.len() as u64;
+            }
             self.cur = Some(Track {
                 title: title.to_string(),
                 path,
                 file: Some(f),
                 proper_start,
-                bytes: 0,
+                bytes,
             });
         }
         Ok(())
@@ -131,6 +168,7 @@ impl Recorder {
     pub fn write_audio(&mut self, data: &[u8]) -> io::Result<()> {
         if let Some(show) = &mut self.show {
             show.write_all(data)?;
+            self.show_bytes += data.len() as u64;
         }
         if !self.no_individual {
             if self.cur.is_none() {
@@ -156,10 +194,30 @@ impl Recorder {
                 f.flush()?;
             }
         }
+        // Cue sheet for the single-file show.
+        if !self.no_cue && !self.cue_entries.is_empty() {
+            if let Some(show_path) = &self.show_path {
+                let show_name = show_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("show")
+                    .to_string();
+                let cue_path = show_path.with_extension("cue");
+                fs::write(&cue_path, cue::render(&show_name, &self.cue_entries))?;
+                eprintln!("[cue] {}", cue_path.display());
+            }
+        }
         Ok(())
     }
 
     fn finalize(&mut self, mut prev: Track) -> io::Result<()> {
+        // Append ID3v1 to mp3/aac tracks before closing, if requested.
+        if self.mp3like && !self.no_id3 && self.with_id3v1 {
+            if let Some(f) = &mut prev.file {
+                let (artist, song) = id3::split_artist_title(&prev.title);
+                f.write_all(&id3::id3v1(artist, song))?;
+            }
+        }
         drop(prev.file.take()); // close the incomplete file
 
         if self.no_individual || prev.path.as_os_str().is_empty() {

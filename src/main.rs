@@ -6,8 +6,10 @@
 
 mod cli;
 mod conn;
+mod cue;
 mod http;
 mod icy;
+mod id3;
 mod recorder;
 mod source;
 mod url;
@@ -72,7 +74,8 @@ fn run(cfg: &Config) -> Result<(), String> {
     }
     say(&format!("metadata interval: {}", info.metaint));
 
-    let mut rec = recorder::Recorder::new(cfg, &info.name, &info.ext).map_err(|e| e.to_string())?;
+    let mut rec = recorder::Recorder::new(cfg, &info.name, &info.ext, info.bitrate.unwrap_or(128))
+        .map_err(|e| e.to_string())?;
     let mut src = source::Source::new(conn, leftover);
 
     let start = Instant::now();

@@ -1,4 +1,4 @@
-# crabripper
+# 🦀 crabripper
 
 A **Rust port of [streamripper](https://github.com/qbus00/streamripper)** — records
 shoutcast/icecast radio streams to disk, split into per-track files, with a relay

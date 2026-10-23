@@ -11,6 +11,7 @@ mod http;
 mod icy;
 mod id3;
 mod recorder;
+mod relay;
 mod source;
 mod url;
 
@@ -74,6 +75,38 @@ fn run(cfg: &Config) -> Result<(), String> {
     }
     say(&format!("metadata interval: {}", info.metaint));
 
+    // Optional relay server.
+    let relay = if let Some(port) = cfg.relay_port {
+        let ip = cfg.relay_ip.clone().unwrap_or_default();
+        match relay::Relay::start(
+            &ip,
+            port,
+            !cfg.no_port_scan,
+            cfg.max_relay,
+            info.name.clone(),
+            info.content_type.clone(),
+        ) {
+            Ok(r) => {
+                let host = if ip.is_empty() || ip == "0.0.0.0" {
+                    "127.0.0.1"
+                } else {
+                    &ip
+                };
+                say(&format!("relay: http://{host}:{}", r.port));
+                if let Some(pl) = &cfg.relay_playlist {
+                    let _ = std::fs::write(pl, format!("http://{host}:{}\n", r.port));
+                }
+                Some(r)
+            }
+            Err(e) => {
+                eprintln!("  ! relay disabled: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut rec = recorder::Recorder::new(cfg, &info.name, &info.ext, info.bitrate.unwrap_or(128))
         .map_err(|e| e.to_string())?;
     let mut src = source::Source::new(conn, leftover);
@@ -102,6 +135,9 @@ fn run(cfg: &Config) -> Result<(), String> {
             }
             total += audio.len() as u64;
             rec.write_audio(&audio).map_err(|e| e.to_string())?;
+            if let Some(r) = &relay {
+                r.broadcast(&audio);
+            }
 
             let len_byte = match src.read_byte().map_err(|e| e.to_string())? {
                 Some(b) => b,
@@ -130,6 +166,9 @@ fn run(cfg: &Config) -> Result<(), String> {
             }
             total += audio.len() as u64;
             rec.write_audio(&audio).map_err(|e| e.to_string())?;
+            if let Some(r) = &relay {
+                r.broadcast(&audio);
+            }
         }
     }
 

@@ -27,7 +27,7 @@ cbc = { version = "0.1", features = ["alloc"] }
 # For the remaining streamripper CLI features:
 encoding_rs = "0.8"  # --codeset-* charset conversion (e.g. CP1250 Polish metadata)
 regex = "1"          # -w metadata rulefiles
-socket2 = "0.5"      # -I bind the outgoing connection to an interface/local IP
+socket2 = { version = "0.5", features = ["all"] }  # -I bind to interface/local IP (bind_device needs "all")
 
 [profile.release]
 opt-level = 3

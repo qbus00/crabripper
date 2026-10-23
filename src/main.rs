@@ -5,9 +5,11 @@
 //! parity with the C fork while using idiomatic, modern Rust underneath.
 
 mod cli;
+mod codeset;
 mod conn;
 mod cue;
 mod decode;
+mod external;
 mod hls;
 mod http;
 mod icy;
@@ -15,6 +17,7 @@ mod id3;
 mod ogg;
 mod recorder;
 mod relay;
+mod rules;
 mod source;
 mod split;
 mod url;
@@ -55,21 +58,10 @@ fn run(cfg: &Config) -> Result<(), String> {
             cfg.url, cfg.user_agent, cfg.timeout, !cfg.no_reconnect
         );
     }
-    // Flags accepted for CLI parity but not yet implemented — warn rather than
-    // silently ignore.
-    let codeset = cfg.codeset_filesys.is_some()
-        || cfg.codeset_id3.is_some()
-        || cfg.codeset_metadata.is_some()
-        || cfg.codeset_relay.is_some();
-    for (set, name) in [
-        (cfg.rulefile.is_some(), "-w (metadata rulefile)"),
-        (cfg.external_cmd.is_some(), "-E (external metadata command)"),
-        (cfg.interface.is_some(), "-I (interface binding)"),
-        (codeset, "--codeset-* (charset conversion)"),
-    ] {
-        if set {
-            eprintln!("  ! {name} is accepted for compatibility but not implemented yet; ignoring");
-        }
+    if cfg.codeset_relay.is_some() {
+        // We relay the de-interleaved audio with no inline metadata, so there is
+        // nothing to transcode — accepted, but a no-op.
+        say("note: --codeset-relay has no effect (the relay carries no metadata)");
     }
 
     say(&format!("Connecting to {} ...", cfg.url));
@@ -152,6 +144,15 @@ fn run(cfg: &Config) -> Result<(), String> {
         recorder::Recorder::new(cfg, &info.name, &ext, info.bitrate.unwrap_or(128), no_split)
             .map_err(|e| e.to_string())?;
 
+    // -E external metadata source (overrides ICY metadata when present).
+    let ext_rx = match &cfg.external_cmd {
+        Some(cmd) => {
+            say(&format!("external metadata: {cmd}"));
+            Some(external::spawn(cmd).map_err(|e| format!("-E: {e}"))?)
+        }
+        None => None,
+    };
+
     let start = Instant::now();
     let deadline = cfg.length.map(|l| start + Duration::from_secs(l));
     let max_bytes = cfg.max_megabytes.map(|m| m * 1024 * 1024);
@@ -183,7 +184,15 @@ fn run(cfg: &Config) -> Result<(), String> {
         };
         let mut src = source::Source::new(conn, leftover);
         match rip_stream(
-            cfg, &info, &ext, &mut rec, &relay, &mut total, &expired, &mut src,
+            cfg,
+            &info,
+            &ext,
+            &mut rec,
+            &relay,
+            &mut total,
+            &expired,
+            &mut src,
+            ext_rx.as_ref(),
         )? {
             StopReason::Done => break,
             StopReason::Disconnected => {
@@ -219,6 +228,7 @@ fn rip_stream(
     total: &mut u64,
     expired: &dyn Fn(u64) -> bool,
     src: &mut source::Source,
+    ext_meta: Option<&std::sync::mpsc::Receiver<String>>,
 ) -> Result<StopReason, String> {
     let say = |m: &str| {
         if !cfg.quiet {
@@ -265,6 +275,7 @@ fn rip_stream(
             if let Some(r) = relay {
                 r.broadcast(&audio);
             }
+            drain_external(ext_meta, cfg, rec)?;
             let len_byte = match src.read_byte().map_err(|e| e.to_string())? {
                 Some(b) => b,
                 None => return Ok(StopReason::Disconnected),
@@ -277,9 +288,14 @@ fn rip_stream(
                 {
                     return Ok(StopReason::Disconnected);
                 }
-                if let Some(title) = icy::parse_stream_title(&meta) {
-                    if !title.is_empty() {
-                        rec.on_title(&title).map_err(|e| e.to_string())?;
+                // ICY metadata — skipped when an external source (-E) is driving.
+                if ext_meta.is_none() {
+                    if let Some(raw) = icy::stream_title_raw(&meta) {
+                        let title = codeset::decode(raw, cfg.codeset_metadata.as_deref());
+                        let title = cfg.rules.apply(&title);
+                        if !title.is_empty() {
+                            rec.on_title(&title).map_err(|e| e.to_string())?;
+                        }
                     }
                 }
             }
@@ -298,8 +314,26 @@ fn rip_stream(
             if let Some(r) = relay {
                 r.broadcast(&audio);
             }
+            drain_external(ext_meta, cfg, rec)?;
         }
     }
+}
+
+/// Apply any pending titles from the external metadata process (-E).
+fn drain_external(
+    ext_meta: Option<&std::sync::mpsc::Receiver<String>>,
+    cfg: &Config,
+    rec: &mut recorder::Recorder,
+) -> Result<(), String> {
+    if let Some(rx) = ext_meta {
+        while let Ok(t) = rx.try_recv() {
+            let t = cfg.rules.apply(&t);
+            if !t.is_empty() {
+                rec.on_title(&t).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Sniff the first bytes of an Ogg body for the FLAC signature (FLAC-in-Ogg).

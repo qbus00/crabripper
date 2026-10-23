@@ -52,6 +52,33 @@ fn other<E: ToString>(e: E) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+/// Connect with the outgoing socket bound to a local IP (any OS) or, on Linux,
+/// an interface name.
+fn connect_bound(
+    addr: &std::net::SocketAddr,
+    timeout: Duration,
+    iface: &str,
+) -> io::Result<TcpStream> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(
+        Domain::for_address(*addr),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    if let Ok(ip) = iface.parse::<std::net::IpAddr>() {
+        sock.bind(&std::net::SocketAddr::new(ip, 0).into())?;
+    } else {
+        #[cfg(target_os = "linux")]
+        sock.bind_device(Some(iface.as_bytes()))?;
+        #[cfg(not(target_os = "linux"))]
+        return Err(other(format!(
+            "-I by interface name ({iface}) is Linux-only; pass a local IP on this OS"
+        )));
+    }
+    sock.connect_timeout(&(*addr).into(), timeout)?;
+    Ok(sock.into())
+}
+
 /// A certificate verifier that accepts everything — the connection is encrypted
 /// but not authenticated, matching the C fork's default. Verification will
 /// become opt-in behind a flag.
@@ -97,14 +124,19 @@ impl ServerCertVerifier for NoVerify {
 
 /// Connect to the URL's host:port, upgrading to TLS for https.
 ///
-/// `timeout` is applied to both the connect and subsequent reads.
-pub fn connect(url: &Url, timeout: Duration) -> io::Result<Conn> {
+/// `timeout` is applied to both the connect and subsequent reads. `bind` (`-I`)
+/// optionally binds the outgoing socket to a local IP, or on Linux an interface
+/// name (SO_BINDTODEVICE).
+pub fn connect(url: &Url, timeout: Duration, bind: Option<&str>) -> io::Result<Conn> {
     let addr = (url.host.as_str(), url.port)
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| other(format!("DNS: no address for {}", url.host)))?;
 
-    let tcp = TcpStream::connect_timeout(&addr, timeout)?;
+    let tcp = match bind {
+        None => TcpStream::connect_timeout(&addr, timeout)?,
+        Some(iface) => connect_bound(&addr, timeout, iface)?,
+    };
     tcp.set_read_timeout(Some(timeout))?;
     tcp.set_nodelay(true).ok();
 

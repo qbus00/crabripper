@@ -36,7 +36,8 @@ The C streamripper works well, but the Rust port gains:
 | Ogg-Vorbis **per-track** splitting (on Ogg logical-stream boundaries) | ✅ |
 | HLS AES-128 decryption (`#EXT-X-KEY`) | ✅ |
 | Auto-reconnect on stream drop (`-c` to disable) | ✅ |
-| Accepted but currently no-ops: `-w`, `-E`, `-I`, `-c`, `--stderr`, `--debug`, `--codeset-*` | ⏳ |
+| Metadata rulefiles (`-w`), external metadata (`-E`), interface bind (`-I`) | ✅ |
+| Charset conversion (`--codeset-metadata`/`-id3`/`-filesys`), `--debug`, `--stderr` | ✅ |
 
 Verified live against real stations (Polish public radio over http/https, SomaFM,
 Radio Paradise FLAC, HLS) on both macOS and a static Linux build on a Synology NAS.

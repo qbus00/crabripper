@@ -5,6 +5,8 @@
 // wide until every feature is wired, then this is removed.
 #![allow(dead_code)]
 
+use crate::rules::Rules;
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -91,8 +93,9 @@ pub struct Config {
     pub xs_search_window: (i32, i32),
     pub xs_silence_length: i32,
 
-    // metadata sources (accepted; some are advanced/unimplemented)
+    // metadata sources
     pub rulefile: Option<String>,     // -w
+    pub rules: Rules,                 // parsed from rulefile
     pub external_cmd: Option<String>, // -E
 
     // console
@@ -149,6 +152,7 @@ impl Default for Config {
             xs_search_window: (0, 0),
             xs_silence_length: 0,
             rulefile: None,
+            rules: Rules::default(),
             external_cmd: None,
             quiet: false,
             to_stderr: false,
@@ -297,6 +301,9 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
 
     if c.url.is_empty() {
         return Err("no stream URL given (try -h)".to_string());
+    }
+    if let Some(rf) = c.rulefile.clone() {
+        c.rules = Rules::load(&rf)?;
     }
     Ok(Parsed::Run(Box::new(c)))
 }

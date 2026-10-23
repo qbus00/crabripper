@@ -21,12 +21,24 @@ fn synchsafe(n: u32) -> [u8; 4] {
     ]
 }
 
-fn text_frame(id: &[u8; 4], text: &str) -> Vec<u8> {
-    // encoding 0x01 = UTF-16 with BOM
-    let mut data = vec![0x01u8, 0xFF, 0xFE];
-    for u in text.encode_utf16() {
-        data.extend_from_slice(&u.to_le_bytes());
-    }
+fn text_frame(id: &[u8; 4], text: &str, codeset: Option<&str>) -> Vec<u8> {
+    // With a codeset (--codeset-id3): single-byte encoding (marker 0x00).
+    // Otherwise UTF-16 with BOM (marker 0x01), which covers any script.
+    let data = match codeset {
+        Some(cs) => {
+            let mut d = vec![0x00u8];
+            d.extend_from_slice(&crate::codeset::encode(text, Some(cs)));
+            d.push(0x00); // NUL terminator
+            d
+        }
+        None => {
+            let mut d = vec![0x01u8, 0xFF, 0xFE];
+            for u in text.encode_utf16() {
+                d.extend_from_slice(&u.to_le_bytes());
+            }
+            d
+        }
+    };
     let mut f = Vec::with_capacity(10 + data.len());
     f.extend_from_slice(id);
     f.extend_from_slice(&(data.len() as u32).to_be_bytes()); // v2.3 frame size: plain u32
@@ -36,13 +48,13 @@ fn text_frame(id: &[u8; 4], text: &str) -> Vec<u8> {
 }
 
 /// Build an ID3v2.3 tag for prepending to an mp3/aac track.
-pub fn id3v2(artist: &str, title: &str) -> Vec<u8> {
+pub fn id3v2(artist: &str, title: &str, codeset: Option<&str>) -> Vec<u8> {
     let mut frames = Vec::new();
     if !title.is_empty() {
-        frames.extend(text_frame(b"TIT2", title));
+        frames.extend(text_frame(b"TIT2", title, codeset));
     }
     if !artist.is_empty() {
-        frames.extend(text_frame(b"TPE1", artist));
+        frames.extend(text_frame(b"TPE1", artist, codeset));
     }
     let mut tag = Vec::with_capacity(10 + frames.len());
     tag.extend_from_slice(b"ID3");
@@ -60,13 +72,28 @@ fn latin1_field(dst: &mut [u8], s: &str) {
 }
 
 /// Build a 128-byte ID3v1 tag for appending.
-pub fn id3v1(artist: &str, title: &str) -> [u8; 128] {
+pub fn id3v1(artist: &str, title: &str, codeset: Option<&str>) -> [u8; 128] {
     let mut t = [0u8; 128];
     t[0..3].copy_from_slice(b"TAG");
-    latin1_field(&mut t[3..33], title);
-    latin1_field(&mut t[33..63], artist);
+    write_field(&mut t[3..33], title, codeset);
+    write_field(&mut t[33..63], artist, codeset);
     t[127] = 255; // genre: unknown
     t
+}
+
+fn write_field(dst: &mut [u8], s: &str, codeset: Option<&str>) {
+    match codeset {
+        Some(cs) => {
+            for (i, &b) in crate::codeset::encode(s, Some(cs))
+                .iter()
+                .take(dst.len())
+                .enumerate()
+            {
+                dst[i] = b;
+            }
+        }
+        None => latin1_field(dst, s),
+    }
 }
 
 #[cfg(test)]
@@ -75,7 +102,7 @@ mod tests {
 
     #[test]
     fn v2_header() {
-        let t = id3v2("A", "B");
+        let t = id3v2("A", "B", None);
         assert_eq!(&t[0..3], b"ID3");
         assert_eq!(t[3], 0x03);
         // size is synchsafe: no byte has the high bit set
@@ -84,7 +111,7 @@ mod tests {
 
     #[test]
     fn v1_is_128() {
-        let t = id3v1("Artist", "Title");
+        let t = id3v1("Artist", "Title", None);
         assert_eq!(&t[0..3], b"TAG");
         assert_eq!(t.len(), 128);
     }

@@ -41,6 +41,8 @@ pub struct Recorder {
     no_id3: bool,
     with_id3v1: bool,
     without_id3v2: bool,
+    codeset_id3: Option<String>,
+    codeset_filesys: Option<String>,
 
     show: Option<File>,
     show_path: Option<PathBuf>,
@@ -109,7 +111,10 @@ impl Recorder {
                 Some(n) => format!("{n}.{ext}"),
                 None => format!("sr_{}.{ext}", now_stamp()),
             };
-            let path = root.join(sanitize(&name));
+            let path = root.join(fs_component(
+                sanitize(&name),
+                cfg.codeset_filesys.as_deref(),
+            ));
             eprintln!("[show file] {}", path.display());
             (Some(File::create(&path)?), Some(path))
         } else {
@@ -131,6 +136,8 @@ impl Recorder {
             no_id3: cfg.no_id3,
             with_id3v1: cfg.with_id3v1,
             without_id3v2: cfg.without_id3v2,
+            codeset_id3: cfg.codeset_id3.clone(),
+            codeset_filesys: cfg.codeset_filesys.clone(),
             show,
             show_path,
             show_bytes: 0,
@@ -206,7 +213,10 @@ impl Recorder {
                 base
             };
             let tx = self.track_ext();
-            let path = self.incomplete.join(format!("{base}.{tx}"));
+            let path = self.incomplete.join(fs_component(
+                format!("{base}.{tx}"),
+                self.codeset_filesys.as_deref(),
+            ));
             let mut bytes = 0u64;
             let file = if self.wav {
                 None // buffered as mp3, decoded to wav at finalize
@@ -215,7 +225,7 @@ impl Recorder {
                 // Prepend ID3v2.3 to mp3/aac tracks (default on; never for wav).
                 if self.mp3like && !self.no_id3 && !self.without_id3v2 {
                     let (artist, song) = id3::split_artist_title(title);
-                    let tag = id3::id3v2(artist, song);
+                    let tag = id3::id3v2(artist, song, self.codeset_id3.as_deref());
                     f.write_all(&tag)?;
                     bytes += tag.len() as u64;
                 }
@@ -320,7 +330,7 @@ impl Recorder {
             if self.mp3like && !self.no_id3 && self.with_id3v1 {
                 if let Some(f) = &mut prev.file {
                     let (artist, song) = id3::split_artist_title(&prev.title);
-                    f.write_all(&id3::id3v1(artist, song))?;
+                    f.write_all(&id3::id3v1(artist, song, self.codeset_id3.as_deref()))?;
                 }
             }
         }
@@ -345,7 +355,10 @@ impl Recorder {
     fn move_completed(&mut self, from: &Path, title: &str, bytes: u64) -> io::Result<()> {
         let seqno = self.seq.map(|start| start + self.completed);
         let base = self.dest_basename(title, seqno);
-        let dest = self.root.join(format!("{base}.{}", self.track_ext()));
+        let dest = self.root.join(fs_component(
+            format!("{base}.{}", self.track_ext()),
+            self.codeset_filesys.as_deref(),
+        ));
         match self.resolve_overwrite(&dest, bytes)? {
             Some(final_dest) => {
                 move_file(from, &final_dest)?;
@@ -400,12 +413,15 @@ impl Recorder {
                 b
             }
         };
-        let path = self.incomplete.join(format!("{base}.{}", self.ext));
+        let path = self.incomplete.join(fs_component(
+            format!("{base}.{}", self.ext),
+            self.codeset_filesys.as_deref(),
+        ));
         let mut f = File::create(&path)?;
         let mut bytes = 0u64;
         if self.mp3like && !self.no_id3 && !self.without_id3v2 {
             let (artist, song) = id3::split_artist_title(title);
-            let tag = id3::id3v2(artist, song);
+            let tag = id3::id3v2(artist, song, self.codeset_id3.as_deref());
             f.write_all(&tag)?;
             bytes += tag.len() as u64;
         }
@@ -413,7 +429,7 @@ impl Recorder {
         bytes += data.len() as u64;
         if self.mp3like && !self.no_id3 && self.with_id3v1 {
             let (artist, song) = id3::split_artist_title(title);
-            f.write_all(&id3::id3v1(artist, song))?;
+            f.write_all(&id3::id3v1(artist, song, self.codeset_id3.as_deref()))?;
             bytes += 128;
         }
         drop(f);
@@ -466,7 +482,10 @@ impl Recorder {
                     .and_then(|s| s.to_str())
                     .unwrap_or(&self.ext);
                 for n in 1..10_000 {
-                    let cand = self.root.join(format!("{stem} ({n}).{ext}"));
+                    let cand = self.root.join(fs_component(
+                        format!("{stem} ({n}).{ext}"),
+                        self.codeset_filesys.as_deref(),
+                    ));
                     if !cand.exists() {
                         return Ok(Some(cand));
                     }
@@ -483,6 +502,25 @@ fn write_wav_file(path: &Path, raw: &[u8], ext: &str) -> io::Result<u64> {
     let mut f = File::create(path)?;
     wav::write_wav(&mut f, &pcm.samples, pcm.channels, pcm.sample_rate)?;
     Ok(pcm.samples.len() as u64 * 2)
+}
+
+/// Encode a filename component in the filesystem codeset (`--codeset-filesys`).
+/// Without a codeset (or off Unix) the UTF-8 name is used as-is.
+fn fs_component(name: String, codeset: Option<&str>) -> std::ffi::OsString {
+    match codeset {
+        Some(cs) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                std::ffi::OsStr::from_bytes(&crate::codeset::encode(&name, Some(cs))).to_os_string()
+            }
+            #[cfg(not(unix))]
+            {
+                std::ffi::OsString::from(name)
+            }
+        }
+        None => std::ffi::OsString::from(name),
+    }
 }
 
 /// Move within the same tree; fall back to copy+remove across filesystems.

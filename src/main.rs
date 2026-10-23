@@ -7,6 +7,7 @@
 mod cli;
 mod conn;
 mod cue;
+mod hls;
 mod http;
 mod icy;
 mod id3;
@@ -14,6 +15,7 @@ mod recorder;
 mod relay;
 mod source;
 mod url;
+mod util;
 
 use cli::{Config, Parsed};
 use std::time::{Duration, Instant};
@@ -50,7 +52,9 @@ fn run(cfg: &Config) -> Result<(), String> {
     }
 
     if info.is_hls {
-        return Err("HLS (.m3u8) handling is not implemented yet (planned increment)".to_string());
+        say("HLS (.m3u8) stream detected");
+        drop(conn); // the HLS ripper re-fetches the playlist as a whole body
+        return hls::rip(&info.final_url, cfg);
     }
 
     say(&format!(

@@ -10,6 +10,58 @@ use std::time::Duration;
 
 type ResponseHead = (String, Vec<(String, String)>, Vec<u8>);
 
+/// A completed one-shot GET (used for HLS playlists and segments).
+pub struct Fetch {
+    pub body: Vec<u8>,
+}
+
+/// GET a URL and read the whole body (HTTP/1.0, Connection: close), following
+/// redirects. For playlists and media segments, not for continuous streams.
+pub fn fetch(url_str: &str, cfg: &Config) -> Result<Fetch, String> {
+    let timeout = Duration::from_secs(cfg.timeout);
+    let mut current = url_str.to_string();
+    for _ in 0..MAX_REDIRECTS {
+        let u = url::parse(&current)?;
+        let mut c = conn::connect(&u, timeout).map_err(|e| e.to_string())?;
+        let request = format!(
+            "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            u.path, u.host, cfg.user_agent
+        );
+        c.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
+        c.flush().ok();
+
+        let (status, headers, leftover) = read_response_head(&mut c).map_err(|e| e.to_string())?;
+        let code = status_code(&status);
+        let get = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+        if (300..400).contains(&code) {
+            if let Some(loc) = get("location") {
+                current = resolve_redirect(&loc, &u);
+                continue;
+            }
+            return Err(format!("redirect ({code}) without Location"));
+        }
+        if code != 200 {
+            return Err(format!("GET {current} -> {status:?}"));
+        }
+        let mut body = leftover;
+        let mut buf = [0u8; 16384];
+        loop {
+            match c.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => body.extend_from_slice(&buf[..n]),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        return Ok(Fetch { body });
+    }
+    Err("too many redirects".to_string())
+}
+
 pub struct StreamInfo {
     pub metaint: usize,
     pub name: String,

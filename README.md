@@ -63,15 +63,19 @@ places take a dependency, where rolling your own would be reckless:
 brew install qbus00/crabripper/crabripper
 ```
 
-Builds from source with the Rust toolchain (pulled in automatically as a
-build-only dependency), so it works on Apple Silicon and Intel macOS and on
-Linuxbrew. Upgrade with `brew upgrade crabripper`; track `main` with
-`brew install --HEAD qbus00/crabripper/crabripper`.
+Pours a **prebuilt binary** for your platform — no Rust toolchain, no compile.
+Covers Apple Silicon **and Intel** macOS, and `x86_64`/`arm64` Linuxbrew.
+Upgrade with `brew upgrade crabripper`.
 
 ### Prebuilt binaries
 
-Each [release](https://github.com/qbus00/crabripper/releases) ships static Linux
-(musl) and Apple Silicon macOS binaries — download, `gunzip`, `chmod +x`, done.
+Each [release](https://github.com/qbus00/crabripper/releases) ships binaries for
+Apple Silicon macOS, Intel macOS, and static (musl) `x86_64`/`arm64` Linux:
+
+```sh
+tar xzf crabripper-macos-arm64.tar.gz   # -> ./crabripper
+./crabripper --version
+```
 
 ## Build
 
@@ -94,12 +98,16 @@ Produces, from a Mac, with no Docker/QEMU:
 | Target | Binary |
 |---|---|
 | Apple Silicon macOS | `crabripper-macos-arm64` |
+| Intel macOS | `crabripper-macos-x86_64` |
 | x86-64 Linux (static musl) | `crabripper-linux-amd64` |
 | aarch64 Linux (static musl) | `crabripper-linux-arm64` |
 
-The Linux targets cross-compile via [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild)
-(zig supplies the linker for the static musl target). Install once: `brew install zig && cargo install cargo-zigbuild`,
-plus `rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl`.
+Both macOS targets build natively with Apple clang (the Intel one cross-compiles
+from Apple Silicon). The Linux targets cross-compile via
+[`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) (zig supplies the
+linker for the static musl target). Install once: `brew install zig && cargo install cargo-zigbuild`,
+plus `rustup target add x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl`.
+Each target also gets a `.tar.gz` (inner binary named `crabripper`) for Homebrew.
 
 ## Usage
 

@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 #
-# Build crabripper for all three release architectures — the same set the C
-# streamripper fork ships — into dist/:
-#   dist/crabripper-macos-arm64   (aarch64-apple-darwin, native)
-#   dist/crabripper-linux-amd64   (x86_64-unknown-linux-musl, fully static)
-#   dist/crabripper-linux-arm64   (aarch64-unknown-linux-musl, fully static)
+# Build crabripper for all release architectures into dist/:
+#   dist/crabripper-macos-arm64    (aarch64-apple-darwin, native)
+#   dist/crabripper-macos-x86_64   (x86_64-apple-darwin, cross from Apple Silicon)
+#   dist/crabripper-linux-amd64    (x86_64-unknown-linux-musl, fully static)
+#   dist/crabripper-linux-arm64    (aarch64-unknown-linux-musl, fully static)
+#
+# Each target also gets a dist/crabripper-<label>.tar.gz whose inner binary is
+# named plain `crabripper` — the layout the Homebrew formula expects.
 #
 # The Linux targets cross-compile from macOS via cargo-zigbuild (zig supplies the
 # C toolchain that ring needs), producing fully-static binaries with no Docker,
-# no QEMU and no OpenSSL.
+# no QEMU and no OpenSSL. Both macOS targets build natively with Apple clang.
 #
 # Usage:
-#   bash scripts/build-all.sh            # all three, release, + .gz copies
-#   bash scripts/build-all.sh --no-gzip  # skip the .gz copies
+#   bash scripts/build-all.sh            # all targets, release, + .tar.gz
+#   bash scripts/build-all.sh --no-gzip  # skip the .tar.gz archives
 #   bash scripts/build-all.sh --verbose  # stream tool output
 #
 # Linux targets need: rustup target add <triple>, cargo install cargo-zigbuild,
@@ -45,11 +48,12 @@ RUSTUP="${CARGO%cargo}rustup"
 VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
 mkdir -p dist
 
-ui_banner "all targets  ·  v$VERSION" "macos-arm64  ·  linux-amd64  ·  linux-arm64"
+ui_banner "all targets  ·  v$VERSION" "macos arm64/x86_64  ·  linux amd64/arm64"
 
 # triple | dist-label | method(native|zig)
 TARGETS="
 aarch64-apple-darwin|macos-arm64|native
+x86_64-apple-darwin|macos-x86_64|native
 x86_64-unknown-linux-musl|linux-amd64|zig
 aarch64-unknown-linux-musl|linux-arm64|zig
 "
@@ -79,11 +83,15 @@ while IFS='|' read -r triple label method; do
     out="dist/crabripper-$label"
     cp "target/$triple/release/crabripper" "$out"
     ui_ok "$out  ($(du -h "$out" | awk '{print $1}'))"
-    if [[ "$GZIP" == 1 ]]; then gzip -kf "$out"; ui_info "gzipped: $out.gz"; fi
+    if [[ "$GZIP" == 1 ]]; then
+      # Archive the binary under its plain name `crabripper` (Homebrew expects it).
+      tar -C "target/$triple/release" -czf "$out.tar.gz" crabripper
+      ui_info "archived: $out.tar.gz"
+    fi
     built=$((built + 1))
   fi
 done <<EOF
 $TARGETS
 EOF
 
-ui_done "crabripper $VERSION" "$built/3 targets -> dist/"
+ui_done "crabripper $VERSION" "$built/4 targets -> dist/"

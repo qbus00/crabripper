@@ -12,6 +12,7 @@ mod hls;
 mod http;
 mod icy;
 mod id3;
+mod ogg;
 mod recorder;
 mod relay;
 mod source;
@@ -139,7 +140,26 @@ fn run(cfg: &Config) -> Result<(), String> {
     let mut total: u64 = 0;
     let mut audio = Vec::new();
 
-    if info.metaint > 0 {
+    if ext == "ogg" {
+        // Ogg Vorbis: split on logical-stream (BOS) boundaries, raw pages copied.
+        say("(ogg — splitting on logical-stream boundaries)");
+        let mut splitter = ogg::OggSplitter::new();
+        while !expired(total) {
+            if !src.read_some(&mut audio).map_err(|e| e.to_string())? {
+                break;
+            }
+            total += audio.len() as u64;
+            for ev in splitter.push(&audio) {
+                if let Some(title) = ev.title {
+                    rec.roll_track(&title).map_err(|e| e.to_string())?;
+                }
+                rec.write_audio(&ev.bytes).map_err(|e| e.to_string())?;
+                if let Some(r) = &relay {
+                    r.broadcast(&ev.bytes);
+                }
+            }
+        }
+    } else if info.metaint > 0 {
         let mut meta = Vec::new();
         loop {
             if expired(total) {

@@ -168,6 +168,13 @@ impl Recorder {
         if !changed {
             return Ok(());
         }
+        self.roll_track(title)
+    }
+
+    /// Finalize the current track and start a new one unconditionally. Used by
+    /// the Ogg path (every logical-stream boundary is a real new track, even if
+    /// two consecutive tracks share a title).
+    pub fn roll_track(&mut self, title: &str) -> io::Result<()> {
         if let Some(prev) = self.cur.take() {
             self.finalize(prev)?;
         }

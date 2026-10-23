@@ -33,7 +33,7 @@ The C streamripper works well, but the Rust port gains:
 | FLAC: native → `.flac`, FLAC-in-Ogg → `.oga`, captured whole | ✅ |
 | `--wav` (decode → 16-bit PCM WAV): mp3 / aac / ogg-vorbis / flac | ✅ |
 | Silence-based splitpoint (`--xs`): mp3, aac | ✅ |
-| Ogg-Vorbis **per-track** splitting on Ogg boundaries | ⏳ (captured whole for now) |
+| Ogg-Vorbis **per-track** splitting (on Ogg logical-stream boundaries) | ✅ |
 | HLS AES-128 decryption | ⏳ (rejected, not silently corrupted) |
 | Accepted but currently no-ops: `-w`, `-E`, `-I`, `-c`, `--stderr`, `--debug`, `--codeset-*` | ⏳ |
 

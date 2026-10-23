@@ -1,0 +1,24 @@
+[package]
+name = "streamripper-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "A Rust port of streamripper (work in progress): records shoutcast/icecast streams to per-track files."
+license = "GPL-2.0-only"
+authors = ["Jakub Kaprzyk"]
+
+[[bin]]
+name = "streamripper-rs"
+path = "src/main.rs"
+
+[dependencies]
+# TLS for https:// streams. native-tls uses the OS stack (Secure Transport on
+# macOS, OpenSSL on Linux) so there is no extra system dependency on macOS.
+# Certificate verification is turned OFF by default to mirror the C fork's
+# behaviour (opt-in verification is a planned flag).
+native-tls = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

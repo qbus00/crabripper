@@ -11,7 +11,7 @@
 
 use crate::cli::{Config, Overwrite};
 use crate::util::{now_stamp, sanitize};
-use crate::{cue, id3};
+use crate::{cue, decode, id3, wav};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -20,6 +20,7 @@ struct Track {
     title: String,
     path: PathBuf, // in incomplete/
     file: Option<File>,
+    raw: Vec<u8>, // buffered encoded bytes, used in --wav mode
     proper_start: bool,
     bytes: u64,
 }
@@ -29,6 +30,7 @@ pub struct Recorder {
     incomplete: PathBuf,
     ext: String,
     mp3like: bool,
+    wav: bool,
     no_split: bool,
     no_individual: bool,
     overwrite: Overwrite,
@@ -74,6 +76,12 @@ impl Recorder {
         let incomplete = root.join("incomplete");
         fs::create_dir_all(&incomplete)?;
 
+        // --wav decodes to 16-bit PCM WAV; minimp3 is mp3-only here.
+        let wav = cfg.wav && ext == "mp3";
+        if cfg.wav && ext == "aac" {
+            eprintln!("  ! --wav supports mp3 only in this port; recording aac as-is");
+        }
+
         let (show, show_path) = if cfg.single_file {
             let name = match &cfg.single_file_name {
                 Some(n) if n.contains('.') => n.clone(),
@@ -92,6 +100,7 @@ impl Recorder {
             incomplete,
             ext: ext.to_string(),
             mp3like: matches!(ext, "mp3" | "aac"),
+            wav,
             no_split,
             no_individual: cfg.no_individual,
             overwrite: cfg.overwrite,
@@ -146,6 +155,7 @@ impl Recorder {
                 title: title.to_string(),
                 path: PathBuf::new(),
                 file: None,
+                raw: Vec::new(),
                 proper_start,
                 bytes: 0,
             });
@@ -156,20 +166,27 @@ impl Recorder {
             } else {
                 base
             };
-            let path = self.incomplete.join(format!("{base}.{}", self.ext));
-            let mut f = File::create(&path)?;
+            let tx = self.track_ext();
+            let path = self.incomplete.join(format!("{base}.{tx}"));
             let mut bytes = 0u64;
-            // Prepend ID3v2.3 to mp3/aac tracks (default on).
-            if self.mp3like && !self.no_id3 && !self.without_id3v2 {
-                let (artist, song) = id3::split_artist_title(title);
-                let tag = id3::id3v2(artist, song);
-                f.write_all(&tag)?;
-                bytes += tag.len() as u64;
-            }
+            let file = if self.wav {
+                None // buffered as mp3, decoded to wav at finalize
+            } else {
+                let mut f = File::create(&path)?;
+                // Prepend ID3v2.3 to mp3/aac tracks (default on; never for wav).
+                if self.mp3like && !self.no_id3 && !self.without_id3v2 {
+                    let (artist, song) = id3::split_artist_title(title);
+                    let tag = id3::id3v2(artist, song);
+                    f.write_all(&tag)?;
+                    bytes += tag.len() as u64;
+                }
+                Some(f)
+            };
             self.cur = Some(Track {
                 title: title.to_string(),
                 path,
-                file: Some(f),
+                file,
+                raw: Vec::new(),
                 proper_start,
                 bytes,
             });
@@ -186,14 +203,26 @@ impl Recorder {
             if self.cur.is_none() {
                 self.on_title("")?;
             }
+            let wav = self.wav;
             if let Some(t) = &mut self.cur {
-                if let Some(f) = &mut t.file {
+                if wav {
+                    t.raw.extend_from_slice(data);
+                    t.bytes += data.len() as u64;
+                } else if let Some(f) = &mut t.file {
                     f.write_all(data)?;
                     t.bytes += data.len() as u64;
                 }
             }
         }
         Ok(())
+    }
+
+    fn track_ext(&self) -> &str {
+        if self.wav {
+            "wav"
+        } else {
+            &self.ext
+        }
     }
 
     /// At shutdown: the in-progress track stays in `incomplete/`.
@@ -204,6 +233,14 @@ impl Recorder {
         if let Some(t) = &mut self.cur {
             if let Some(f) = &mut t.file {
                 f.flush()?;
+            }
+        }
+        // In --wav mode, write the in-progress last track (it stays in incomplete/).
+        if self.wav {
+            if let Some(t) = &self.cur {
+                if !t.raw.is_empty() {
+                    let _ = write_wav_file(&t.path, &t.raw);
+                }
             }
         }
         // Cue sheet for the single-file show.
@@ -223,11 +260,18 @@ impl Recorder {
     }
 
     fn finalize(&mut self, mut prev: Track) -> io::Result<()> {
-        // Append ID3v1 to mp3/aac tracks before closing, if requested.
-        if self.mp3like && !self.no_id3 && self.with_id3v1 {
-            if let Some(f) = &mut prev.file {
-                let (artist, song) = id3::split_artist_title(&prev.title);
-                f.write_all(&id3::id3v1(artist, song))?;
+        if self.wav {
+            // Decode the buffered mp3 to a .wav at the incomplete path.
+            if !prev.raw.is_empty() {
+                prev.bytes = write_wav_file(&prev.path, &prev.raw)?;
+            }
+        } else {
+            // Append ID3v1 to mp3/aac tracks before closing, if requested.
+            if self.mp3like && !self.no_id3 && self.with_id3v1 {
+                if let Some(f) = &mut prev.file {
+                    let (artist, song) = id3::split_artist_title(&prev.title);
+                    f.write_all(&id3::id3v1(artist, song))?;
+                }
             }
         }
         drop(prev.file.take()); // close the incomplete file
@@ -246,7 +290,7 @@ impl Recorder {
 
         let seqno = self.seq.map(|start| start + self.completed);
         let base = self.dest_basename(&prev.title, seqno);
-        let dest = self.root.join(format!("{base}.{}", self.ext));
+        let dest = self.root.join(format!("{base}.{}", self.track_ext()));
         match self.resolve_overwrite(&dest, prev.bytes)? {
             Some(final_dest) => {
                 move_file(&prev.path, &final_dest)?;
@@ -307,6 +351,14 @@ impl Recorder {
             }
         }
     }
+}
+
+/// Decode buffered mp3 bytes and write a .wav at `path`; returns the wav size.
+fn write_wav_file(path: &Path, raw: &[u8]) -> io::Result<u64> {
+    let pcm = decode::decode_mp3(raw);
+    let mut f = File::create(path)?;
+    wav::write_wav(&mut f, &pcm.samples, pcm.channels, pcm.sample_rate)?;
+    Ok(pcm.samples.len() as u64 * 2)
 }
 
 /// Move within the same tree; fall back to copy+remove across filesystems.

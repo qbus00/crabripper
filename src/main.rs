@@ -7,6 +7,7 @@
 mod cli;
 mod conn;
 mod cue;
+mod decode;
 mod hls;
 mod http;
 mod icy;
@@ -16,6 +17,7 @@ mod relay;
 mod source;
 mod url;
 mod util;
+mod wav;
 
 use cli::{Config, Parsed};
 use std::time::{Duration, Instant};

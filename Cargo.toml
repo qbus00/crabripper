@@ -19,6 +19,10 @@ path = "src/main.rs"
 # to mirror the C fork (opt-in verification is a planned flag).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
+# Build-time only: compiles the vendored minimp3 (C). No runtime crates added.
+[build-dependencies]
+cc = "1"
+
 [profile.release]
 opt-level = 3
 lto = true

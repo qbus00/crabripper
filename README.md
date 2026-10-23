@@ -34,7 +34,8 @@ The C streamripper works well, but the Rust port gains:
 | `--wav` (decode → 16-bit PCM WAV): mp3 / aac / ogg-vorbis / flac | ✅ |
 | Silence-based splitpoint (`--xs`): mp3, aac | ✅ |
 | Ogg-Vorbis **per-track** splitting (on Ogg logical-stream boundaries) | ✅ |
-| HLS AES-128 decryption | ⏳ (rejected, not silently corrupted) |
+| HLS AES-128 decryption (`#EXT-X-KEY`) | ✅ |
+| Auto-reconnect on stream drop (`-c` to disable) | ✅ |
 | Accepted but currently no-ops: `-w`, `-E`, `-I`, `-c`, `--stderr`, `--debug`, `--codeset-*` | ⏳ |
 
 Verified live against real stations (Polish public radio over http/https, SomaFM,

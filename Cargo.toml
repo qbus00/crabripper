@@ -21,6 +21,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # Pure-Rust multi-codec decoder for --wav and silence detection. One crate
 # replaces the C fork's minimp3 + faad2 + libvorbis (three C libs). No C build.
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "flac", "vorbis", "ogg"] }
+# AES-128-CBC for HLS #EXT-X-KEY segment decryption (audited pure Rust, no C).
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
 
 [profile.release]
 opt-level = 3

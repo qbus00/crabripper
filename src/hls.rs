@@ -5,7 +5,7 @@
 use crate::cli::{Config, HlsVariant};
 use crate::http;
 use crate::util::{now_stamp, sanitize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
@@ -50,6 +50,7 @@ pub fn rip(url: &str, cfg: &Config) -> Result<(), String> {
     let expired = || deadline.is_some_and(|d| Instant::now() >= d);
 
     let mut seen: HashSet<String> = HashSet::new();
+    let mut key_cache: HashMap<String, [u8; 16]> = HashMap::new();
     let mut total: u64 = 0;
     let mut nsegs: u64 = 0;
 
@@ -59,23 +60,42 @@ pub fn rip(url: &str, cfg: &Config) -> Result<(), String> {
         }
         let mp = http::fetch(&media_url, cfg)?;
         let mptext = String::from_utf8_lossy(&mp.body).to_string();
-        if mptext.contains("#EXT-X-KEY") && mptext.to_uppercase().contains("METHOD=AES") {
-            return Err("AES-128 encrypted HLS is not supported yet".to_string());
-        }
         let target = parse_target_duration(&mptext).unwrap_or(3);
+        let entries = parse_media(&mptext)?; // errors on SAMPLE-AES / unsupported
 
         let mut got_new = false;
-        for seg in parse_segments(&mptext) {
+        for entry in entries {
             if expired() {
                 break;
             }
-            let segurl = resolve_url(&media_url, &seg);
+            let segurl = resolve_url(&media_url, &entry.url);
             if !seen.insert(segurl.clone()) {
                 continue;
             }
-            let data = http::fetch(&segurl, cfg)?;
-            file.write_all(&data.body).map_err(|e| e.to_string())?;
-            total += data.body.len() as u64;
+            let data = http::fetch(&segurl, cfg)?.body;
+            let out = match &entry.key {
+                Some(k) => {
+                    let key_url = resolve_url(&media_url, &k.uri);
+                    let key = match key_cache.get(&key_url) {
+                        Some(k) => *k,
+                        None => {
+                            let kb = http::fetch(&key_url, cfg)?.body;
+                            if kb.len() != 16 {
+                                return Err(format!("HLS key is {} bytes, expected 16", kb.len()));
+                            }
+                            let mut arr = [0u8; 16];
+                            arr.copy_from_slice(&kb);
+                            key_cache.insert(key_url, arr);
+                            arr
+                        }
+                    };
+                    let iv = k.iv.unwrap_or_else(|| iv_from_seq(entry.seq));
+                    aes128_cbc_decrypt(&key, &iv, &data).ok_or("HLS AES-128 decryption failed")?
+                }
+                None => data,
+            };
+            file.write_all(&out).map_err(|e| e.to_string())?;
+            total += out.len() as u64;
             nsegs += 1;
             got_new = true;
         }
@@ -99,12 +119,125 @@ pub fn rip(url: &str, cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_segments(mp: &str) -> Vec<String> {
-    mp.lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| l.to_string())
-        .collect()
+#[derive(Clone)]
+struct KeyInfo {
+    uri: String,
+    iv: Option<[u8; 16]>,
+}
+
+struct SegEntry {
+    url: String,
+    seq: u64,
+    key: Option<KeyInfo>,
+}
+
+/// Parse a media playlist into segments, tracking media sequence and the active
+/// `#EXT-X-KEY`. Errors on encryption schemes we can't handle (SAMPLE-AES, etc.).
+fn parse_media(mp: &str) -> Result<Vec<SegEntry>, String> {
+    let mut seq = mp
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("#EXT-X-MEDIA-SEQUENCE:")
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    let mut key: Option<KeyInfo> = None;
+    let mut out = Vec::new();
+
+    for line in mp.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("#EXT-X-KEY:") {
+            let attrs = parse_attrs(rest);
+            match attrs.get("METHOD").map(|s| s.as_str()) {
+                Some("NONE") | None => key = None,
+                Some("AES-128") => {
+                    let uri = attrs.get("URI").cloned().unwrap_or_default();
+                    let iv = attrs.get("IV").and_then(|v| parse_hex_iv(v));
+                    key = Some(KeyInfo { uri, iv });
+                }
+                Some(other) => {
+                    return Err(format!("HLS encryption METHOD={other} is not supported"));
+                }
+            }
+        } else if !line.is_empty() && !line.starts_with('#') {
+            out.push(SegEntry {
+                url: line.to_string(),
+                seq,
+                key: key.clone(),
+            });
+            seq += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Parse `KEY=VALUE,KEY="QUOTED",...` attribute lists.
+fn parse_attrs(s: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // key
+        let kstart = i;
+        while i < bytes.len() && bytes[i] != b'=' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let key = s[kstart..i].trim().to_string();
+        i += 1; // skip '='
+        let val = if i < bytes.len() && bytes[i] == b'"' {
+            i += 1;
+            let vstart = i;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            let v = s[vstart..i].to_string();
+            i += 1; // skip closing quote
+            v
+        } else {
+            let vstart = i;
+            while i < bytes.len() && bytes[i] != b',' {
+                i += 1;
+            }
+            s[vstart..i].trim().to_string()
+        };
+        map.insert(key.to_ascii_uppercase(), val);
+        while i < bytes.len() && (bytes[i] == b',' || bytes[i] == b' ') {
+            i += 1;
+        }
+    }
+    map
+}
+
+fn parse_hex_iv(v: &str) -> Option<[u8; 16]> {
+    let h = v.trim().trim_start_matches("0x").trim_start_matches("0X");
+    if h.len() != 32 {
+        return None;
+    }
+    let mut iv = [0u8; 16];
+    for (i, b) in iv.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(iv)
+}
+
+/// Default HLS IV: the 128-bit big-endian media sequence number.
+fn iv_from_seq(seq: u64) -> [u8; 16] {
+    let mut iv = [0u8; 16];
+    iv[8..].copy_from_slice(&seq.to_be_bytes());
+    iv
+}
+
+fn aes128_cbc_decrypt(key: &[u8; 16], iv: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
+    use cbc::cipher::block_padding::Pkcs7;
+    use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+    type Dec = cbc::Decryptor<aes::Aes128>;
+    Dec::new(key.into(), iv.into())
+        .decrypt_padded_vec_mut::<Pkcs7>(data)
+        .ok()
 }
 
 fn parse_target_duration(mp: &str) -> Option<u64> {

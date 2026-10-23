@@ -55,9 +55,10 @@ for c in cargo "$HOME/.cargo/bin/cargo" /opt/homebrew/opt/rustup/bin/cargo /usr/
   if command -v "$c" >/dev/null 2>&1; then CARGO="$(command -v "$c")"; break; fi
 done
 [[ -n "$CARGO" ]] || ui_die "cargo not found. Install Rust: https://rustup.rs (or: brew install rustup && rustup default stable)"
-# Put cargo's own directory on PATH so it can find its subcommand helpers
-# (cargo-fmt, cargo-clippy) — needed with Homebrew's keg-only rustup.
-export PATH="$(dirname "$CARGO"):$PATH"
+# Put cargo's own directory (for cargo-fmt/cargo-clippy, needed with Homebrew's
+# keg-only rustup) and ~/.cargo/bin (for `cargo install`ed subcommands such as
+# cargo-zigbuild) on PATH.
+export PATH="$HOME/.cargo/bin:$(dirname "$CARGO"):$PATH"
 
 VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
 BUILD_FLAGS=()
@@ -108,7 +109,15 @@ fi
 
 # --- build ---
 ui_section "Build"
-ui_run build "Compiling ($PROFILE)" "$CARGO" build ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} \
+# For a Linux cross target, prefer cargo-zigbuild (uses zig as the C
+# compiler/linker, so ring's C builds and links cleanly from macOS). Fall back
+# to plain `cargo build --target` when zigbuild isn't installed.
+CARGO_SUB="build"
+if [[ -n "$CROSS" && "$CROSS" == *linux* ]] && command -v cargo-zigbuild >/dev/null 2>&1; then
+  CARGO_SUB="zigbuild"
+  ui_info "using cargo-zigbuild for $CROSS"
+fi
+ui_run build "Compiling ($PROFILE)" "$CARGO" "$CARGO_SUB" ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} \
   || ui_die "build failed (see above)"
 
 # --- report ---

@@ -12,11 +12,12 @@ name = "streamripper-rs"
 path = "src/main.rs"
 
 [dependencies]
-# TLS for https:// streams. native-tls uses the OS stack (Secure Transport on
-# macOS, OpenSSL on Linux) so there is no extra system dependency on macOS.
-# Certificate verification is turned OFF by default to mirror the C fork's
-# behaviour (opt-in verification is a planned flag).
-native-tls = "0.2"
+# TLS for https:// streams — the one place we take a dependency, since rolling
+# your own crypto is never acceptable. rustls is pure Rust (ring crypto backend,
+# no OpenSSL/C), which keeps the Linux build fully static and cross-compilable
+# from macOS with no system libraries. Certificate verification is OFF by default
+# to mirror the C fork (opt-in verification is a planned flag).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [profile.release]
 opt-level = 3

@@ -3,9 +3,14 @@ name = "crabripper"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
-description = "A Rust port of streamripper (work in progress): records shoutcast/icecast streams to per-track files."
+description = "A Rust port of streamripper: records shoutcast/icecast streams to per-track files."
 license = "GPL-2.0-only"
 authors = ["Jakub Kaprzyk"]
+homepage = "https://github.com/qbus00/crabripper"
+repository = "https://github.com/qbus00/crabripper"
+readme = "README.md"
+keywords = ["streamripper", "icecast", "shoutcast", "radio", "recorder"]
+categories = ["command-line-utilities", "multimedia::audio"]
 
 [[bin]]
 name = "crabripper"
@@ -16,7 +21,7 @@ path = "src/main.rs"
 # your own crypto is never acceptable. rustls is pure Rust (ring crypto backend,
 # no OpenSSL/C), which keeps the Linux build fully static and cross-compilable
 # from macOS with no system libraries. Certificate verification is OFF by default
-# to mirror the C fork (opt-in verification is a planned flag).
+# to mirror the C fork; pass --ssl-verify for real cert checks (Mozilla roots).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Pure-Rust multi-codec decoder for --wav and silence detection. One crate
 # replaces the C fork's minimp3 + faad2 + libvorbis (three C libs). No C build.

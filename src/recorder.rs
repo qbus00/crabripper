@@ -9,9 +9,9 @@
 //! ID3 tags (v2.3 prepended to mp3/aac tracks, optional v1 appended) and cue
 //! sheets for single-file (`-a`) recordings are written here too.
 
-use crate::cli::{Config, Overwrite};
+use crate::cli::{Config, Overwrite, Xs};
 use crate::util::{now_stamp, sanitize};
-use crate::{cue, decode, id3, wav};
+use crate::{cue, decode, id3, split, wav};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -53,6 +53,16 @@ pub struct Recorder {
     completed: u32,
     seen: u32,
     kept: u32,
+
+    // silence-based splitpoint (mp3, individual, --xs != none)
+    silence: bool,
+    xs_pre: usize,
+    xs_post: usize,
+    xs_offset_bytes: isize,
+    pend: Vec<u8>,
+    pend_title: String,
+    pend_started: bool,
+    pend_proper: bool,
 }
 
 impl Recorder {
@@ -81,6 +91,13 @@ impl Recorder {
         if cfg.wav && ext == "aac" {
             eprintln!("  ! --wav supports mp3 only in this port; recording aac as-is");
         }
+
+        // Silence-based splitpoint (mp3 only), on by default like streamripper.
+        let silence = ext == "mp3" && !cfg.no_individual && cfg.xs != Xs::None && !wav && !no_split;
+        let bpms = (bitrate_kbps.max(1) as usize / 8).max(1); // bytes per millisecond
+        let (pre_ms, post_ms) = cfg.xs_search_window;
+        let pre_ms = if pre_ms > 0 { pre_ms } else { 1500 };
+        let post_ms = if post_ms > 0 { post_ms } else { 1500 };
 
         let (show, show_path) = if cfg.single_file {
             let name = match &cfg.single_file_name {
@@ -120,6 +137,14 @@ impl Recorder {
             completed: 0,
             seen: 0,
             kept: 0,
+            silence,
+            xs_pre: pre_ms as usize * bpms,
+            xs_post: post_ms as usize * bpms,
+            xs_offset_bytes: cfg.xs_offset as isize * bpms as isize,
+            pend: Vec::new(),
+            pend_title: String::new(),
+            pend_started: false,
+            pend_proper: false,
         })
     }
 
@@ -128,6 +153,9 @@ impl Recorder {
         // Whole-capture formats (FLAC) are never split: keep the single track.
         if self.no_split && self.cur.is_some() {
             return Ok(());
+        }
+        if self.silence {
+            return self.handle_silence_title(title);
         }
         let changed = match &self.cur {
             Some(t) => t.title != title,
@@ -199,6 +227,11 @@ impl Recorder {
             show.write_all(data)?;
             self.show_bytes += data.len() as u64;
         }
+        if self.silence {
+            // Buffer; tracks are cut at the quietest point on each boundary.
+            self.pend.extend_from_slice(data);
+            return Ok(());
+        }
         if !self.no_individual {
             if self.cur.is_none() {
                 self.on_title("")?;
@@ -242,6 +275,12 @@ impl Recorder {
                     let _ = write_wav_file(&t.path, &t.raw);
                 }
             }
+        }
+        // Silence mode: flush the in-progress last track to incomplete/.
+        if self.silence && !self.pend.is_empty() {
+            let title = std::mem::take(&mut self.pend_title);
+            let data = std::mem::take(&mut self.pend);
+            self.emit_silence_track(&title, false, &data)?;
         }
         // Cue sheet for the single-file show.
         if !self.no_cue && !self.cue_entries.is_empty() {
@@ -287,21 +326,95 @@ impl Recorder {
             self.kept += 1;
             return Ok(());
         }
+        self.move_completed(&prev.path, &prev.title, prev.bytes)
+    }
 
+    /// Move a finalized track from `incomplete/` to the destination, applying the
+    /// name pattern/sequence and overwrite mode.
+    fn move_completed(&mut self, from: &Path, title: &str, bytes: u64) -> io::Result<()> {
         let seqno = self.seq.map(|start| start + self.completed);
-        let base = self.dest_basename(&prev.title, seqno);
+        let base = self.dest_basename(title, seqno);
         let dest = self.root.join(format!("{base}.{}", self.track_ext()));
-        match self.resolve_overwrite(&dest, prev.bytes)? {
+        match self.resolve_overwrite(&dest, bytes)? {
             Some(final_dest) => {
-                move_file(&prev.path, &final_dest)?;
+                move_file(from, &final_dest)?;
                 self.completed += 1;
                 eprintln!("[track {:>3}] {}", self.completed, final_dest.display());
             }
             None => {
-                let _ = fs::remove_file(&prev.path);
+                let _ = fs::remove_file(from);
             }
         }
         Ok(())
+    }
+
+    // ---- silence-based splitpoint path (mp3) ----
+
+    fn handle_silence_title(&mut self, title: &str) -> io::Result<()> {
+        if !self.pend_started {
+            // First title: the audio buffered so far is this (partial) first track.
+            self.seen += 1;
+            self.pend_title = title.to_string();
+            self.pend_started = true;
+            self.pend_proper = false;
+            return Ok(());
+        }
+        // A real boundary: cut the pending track at the quietest nearby frame.
+        let boundary = (self.pend.len() as isize + self.xs_offset_bytes)
+            .clamp(0, self.pend.len() as isize) as usize;
+        let cut =
+            split::find_split(&self.pend, boundary, self.xs_pre, self.xs_post).min(self.pend.len());
+
+        let prev_title = std::mem::take(&mut self.pend_title);
+        let prev_proper = self.pend_proper;
+        let head = self.pend[..cut].to_vec();
+        let tail = self.pend[cut..].to_vec();
+        self.emit_silence_track(&prev_title, prev_proper, &head)?;
+
+        self.pend = tail;
+        self.seen += 1;
+        self.pend_title = title.to_string();
+        self.pend_proper = true;
+        Ok(())
+    }
+
+    /// Write a silence-cut track to `incomplete/` (with ID3), then move it unless
+    /// it is the partial first track or within the keep-incomplete count.
+    fn emit_silence_track(&mut self, title: &str, proper: bool, data: &[u8]) -> io::Result<()> {
+        let base = {
+            let b = sanitize(title);
+            if b.is_empty() {
+                format!("track_{:03}", self.seen.max(1))
+            } else {
+                b
+            }
+        };
+        let path = self.incomplete.join(format!("{base}.{}", self.ext));
+        let mut f = File::create(&path)?;
+        let mut bytes = 0u64;
+        if self.mp3like && !self.no_id3 && !self.without_id3v2 {
+            let (artist, song) = id3::split_artist_title(title);
+            let tag = id3::id3v2(artist, song);
+            f.write_all(&tag)?;
+            bytes += tag.len() as u64;
+        }
+        f.write_all(data)?;
+        bytes += data.len() as u64;
+        if self.mp3like && !self.no_id3 && self.with_id3v1 {
+            let (artist, song) = id3::split_artist_title(title);
+            f.write_all(&id3::id3v1(artist, song))?;
+            bytes += 128;
+        }
+        drop(f);
+
+        if !proper {
+            return Ok(()); // partial first (or last in-progress): stays in incomplete
+        }
+        if self.kept < self.keep_incomplete {
+            self.kept += 1;
+            return Ok(());
+        }
+        self.move_completed(&path, title, bytes)
     }
 
     fn dest_basename(&self, title: &str, seqno: Option<u32>) -> String {

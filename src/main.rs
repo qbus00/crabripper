@@ -15,6 +15,7 @@ mod id3;
 mod recorder;
 mod relay;
 mod source;
+mod split;
 mod url;
 mod util;
 mod wav;

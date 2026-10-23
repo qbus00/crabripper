@@ -80,3 +80,46 @@ pub fn decode_mp3(data: &[u8]) -> Pcm {
         sample_rate: sample_rate.max(1) as u32,
     }
 }
+
+/// For silence detection: `(byte offset of each frame's start, peak |sample|)`.
+pub fn frame_volumes(data: &[u8]) -> Vec<(usize, i32)> {
+    let mut frames = Vec::new();
+    let mut pcm = [0i16; MAX_SAMPLES_PER_FRAME];
+    let mut pos = 0usize;
+    unsafe {
+        let dec = sr_mp3_new();
+        if dec.is_null() {
+            return frames;
+        }
+        while pos < data.len() {
+            let mut c = 0i32;
+            let mut h = 0i32;
+            let mut fb = 0i32;
+            let got = sr_mp3_decode(
+                dec,
+                data[pos..].as_ptr(),
+                (data.len() - pos) as c_int,
+                pcm.as_mut_ptr(),
+                &mut c,
+                &mut h,
+                &mut fb,
+            );
+            if fb == 0 {
+                break;
+            }
+            let frame_off = pos;
+            pos += fb as usize;
+            if got > 0 {
+                let n = (got as usize * c.max(1) as usize).min(pcm.len());
+                let peak = pcm[..n]
+                    .iter()
+                    .map(|s| (*s as i32).abs())
+                    .max()
+                    .unwrap_or(0);
+                frames.push((frame_off, peak));
+            }
+        }
+        sr_mp3_free(dec);
+    }
+    frames
+}

@@ -1,73 +1,116 @@
 # streamripper-rs
 
-A work-in-progress **Rust port of [streamripper](https://github.com/qbus00/streamripper)** —
-records shoutcast/icecast radio streams to disk, split into per-track files.
+A **Rust port of [streamripper](https://github.com/qbus00/streamripper)** — records
+shoutcast/icecast radio streams to disk, split into per-track files, with a relay
+server, HLS support and more. It aims for **CLI and behaviour parity** with the C
+fork while using idiomatic, modern Rust and **as few dependencies as possible**.
 
-This is an independent sibling to the C fork; it does not share its git history.
+> Independent sibling of the C fork; it does not share that project's git history.
 
-## Status
+## Why
 
-Early, but it genuinely records. The first slice covers the core path:
+The C streamripper works well, but the Rust port gains:
 
-- **HTTP and HTTPS** stream connections (TLS via `native-tls`; certificate
-  verification is off by default, matching the C fork).
-- **ICY inline metadata** (`Icy-MetaData: 1`): reads `icy-metaint`, `icy-name`,
-  `content-type`, de-interleaves the metadata blocks.
-- **Track splitting** driven by `StreamTitle` changes — one file per song, named
-  from the metadata.
-- Handles both `HTTP/1.x` and shoutcast's `ICY 200 OK` status lines.
-- Extension chosen from content-type (`mp3`/`aac`/`ogg`/`flac`).
+- **One pure-Rust TLS stack** (rustls) → a **fully-static Linux binary** that
+  cross-compiles straight from macOS with **no Docker, no QEMU, no OpenSSL**.
+- Memory safety, a clean module layout, and **HTTP redirect following** (which the
+  C version lacks — e.g. Radio 357's CDN).
 
-Verified live against real stations (Radio Kraków over HTTP, SomaFM over HTTPS —
-the latter rolled cleanly from the buffering track into a correctly-named song
-file).
+## Status — feature parity
+
+| Feature | Status |
+|---|---|
+| HTTP + HTTPS streams (TLS via rustls, verify off by default) | ✅ |
+| ICY inline metadata + track splitting | ✅ |
+| Output layout: per-stream subdir, `incomplete/`→complete lifecycle | ✅ |
+| Single-file (`-a`), no-individual (`-A`), overwrite modes (`-o`) | ✅ |
+| Sequence numbers (`-q`), name patterns (`-D`), keep-incomplete (`-k`) | ✅ |
+| Length forms: seconds / `90s`/`12m`/`2h` / `hh:mm[:ss]`, size limit (`-M`) | ✅ |
+| ID3 tags (v2.3 prepended, v1 appended; UTF-16 so Polish survives) | ✅ |
+| Cue sheets for single-file recordings | ✅ |
+| Relay server (`-r`/`-R`/`-z`/`-L`) | ✅ |
+| HLS (`.m3u8`): master→variant, poll + concatenate segments | ✅ |
+| FLAC: native → `.flac`, FLAC-in-Ogg → `.oga`, captured whole | ✅ |
+| `--wav` (decode mp3 → 16-bit PCM WAV, via vendored minimp3) | ✅ (mp3) |
+| Silence-based splitpoint (`--xs`, mp3) | ✅ |
+| Ogg-Vorbis **per-track** splitting on Ogg boundaries | ⏳ (captured whole for now) |
+| `--wav`/silence for **aac/vorbis** | ⏳ (mp3 only) |
+| HLS AES-128 decryption | ⏳ (rejected, not silently corrupted) |
+| Accepted but currently no-ops: `-w`, `-E`, `-I`, `-c`, `--stderr`, `--debug`, `--codeset-*` | ⏳ |
+
+Verified live against real stations (Polish public radio over http/https, SomaFM,
+Radio Paradise FLAC, HLS) on both macOS and a static Linux build on a Synology NAS.
+
+## Dependencies — deliberately minimal
+
+Everything (URL/HTTP/ICY/args/output/relay/HLS) is hand-rolled on `std`. Only two
+places take a dependency, where rolling your own would be reckless:
+
+- **TLS:** `rustls` (pure Rust, `ring` backend — no OpenSSL).
+- **MP3 decode** (for `--wav` + silence): the **vendored, public-domain
+  [minimp3](https://github.com/lieff/minimp3)** C header, compiled at build time
+  via `cc` — **no runtime crates added**. (It's the same decoder the C fork uses.)
 
 ## Build
 
-Needs a Rust toolchain (`rustup`). The build script does the ceremony — toolchain
-check, `rustfmt` check, `clippy -D warnings`, tests, then the build — and reports
-the binary:
+Needs a Rust toolchain (`rustup`). The build script runs fmt + clippy + tests
+then builds, with a banner and progress:
 
 ```sh
-bash scripts/build.sh            # release build, with checks + tests
-bash scripts/build.sh --debug    # debug build
-bash scripts/build.sh --fast     # skip checks/tests
-bash scripts/build.sh --run -- <url> -d ./rec -l 60   # build then run
+bash scripts/build.sh                 # release, with checks
+bash scripts/build.sh --run -- URL -d ./rec -l 60   # build then run
 ```
 
-Or plain cargo:
+### All release architectures (like the C fork)
 
 ```sh
-cargo build --release
+bash scripts/build-all.sh             # -> dist/
 ```
+
+Produces, from a Mac, with no Docker/QEMU:
+
+| Target | Binary |
+|---|---|
+| Apple Silicon macOS | `streamripper-rs-macos-arm64` |
+| x86-64 Linux (static musl) | `streamripper-rs-linux-amd64` |
+| aarch64 Linux (static musl) | `streamripper-rs-linux-arm64` |
+
+The Linux targets cross-compile via [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild)
+(zig supplies the C toolchain for minimp3). Install once: `brew install zig && cargo install cargo-zigbuild`,
+plus `rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl`.
 
 ## Usage
 
 ```sh
-streamripper-rs <URL> [options]
-
-  -d <dir>    output directory (default: current dir)
-  -l <secs>   stop after N seconds (default: run until stopped)
-  -u <agent>  HTTP User-Agent
-  -m <secs>   connect/read timeout (default: 30)
-
-# example
-streamripper-rs http://stream4.nadaje.com:9680/radiokrakow-s3 -d ./rec -l 60
+streamripper-rs URL [options]
 ```
 
-## Roadmap
+Common options (run `-h` for the full streamripper-compatible list):
 
-Ordered roughly by priority:
+| Option | Meaning |
+|---|---|
+| `-d dir` | output directory |
+| `-s` | no per-stream subdirectory |
+| `-a [file]` | single-file recording (+ cue) |
+| `-A` | don't write individual tracks |
+| `-l len` | run time: `3600`, `90s`/`12m`/`2h`, or `1:30:00` |
+| `-r [[ip:]port]` | relay server (default port 8000) |
+| `-u agent` | custom User-Agent |
+| `--wav` | decode mp3 tracks to `.wav` |
+| `--no-cue` / `-i` | no cue sheet / no ID3 tags |
+| `--ssl-verify` | verify TLS cert (off by default, like the C fork) |
 
-- **Follow HTTP redirects** (301/302/307) — some CDNs (e.g. Radio 357) redirect.
-- **Switch TLS to `rustls`** (pure Rust) so Linux builds are fully static with no
-  OpenSSL — enables trivial cross-compilation from macOS.
-- **HLS (`.m3u8`)** playlist polling + segment concatenation.
-- **Silence-based splitpoint** refinement (decode mp3/aac to find a quiet point).
-- **FLAC** capture (native + Ogg-FLAC), **cue sheets**, **`--wav`** decode.
-- **Relay server**, single-file (`-a`) mode, config flags parity with the C CLI.
+```sh
+# examples
+streamripper-rs http://stream4.nadaje.com:9680/radiokrakow-s3 -d ~/rec -l 1h
+streamripper-rs https://ice1.somafm.com/indiepop-128-mp3 -r 8000 -u "WinampMPEG/5.0"
+streamripper-rs "https://example.com/live/playlist.m3u8" -a show.aac -l 2h
+```
 
-## License
+## Credits & license
 
-GPL-2.0-only, matching upstream streamripper.
-Fork/port by Jakub Kaprzyk.
+A port of **streamripper** by Jon Clegg and Gregory C. Sharp. Fork changes and
+this Rust port by **Jakub Kaprzyk**.
+
+Licensed under the **GNU General Public License, version 2** (GPL-2.0-only), the
+same as upstream streamripper. The vendored `minimp3` is public domain (CC0).

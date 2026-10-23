@@ -29,6 +29,7 @@ pub struct Recorder {
     incomplete: PathBuf,
     ext: String,
     mp3like: bool,
+    no_split: bool,
     no_individual: bool,
     overwrite: Overwrite,
     pattern: Option<String>,
@@ -53,7 +54,13 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    pub fn new(cfg: &Config, stream_name: &str, ext: &str, bitrate_kbps: u32) -> io::Result<Self> {
+    pub fn new(
+        cfg: &Config,
+        stream_name: &str,
+        ext: &str,
+        bitrate_kbps: u32,
+        no_split: bool,
+    ) -> io::Result<Self> {
         let mut root = PathBuf::from(cfg.output_dir.clone().unwrap_or_else(|| ".".to_string()));
         if !cfg.no_subdir {
             let base = sanitize(stream_name);
@@ -85,6 +92,7 @@ impl Recorder {
             incomplete,
             ext: ext.to_string(),
             mp3like: matches!(ext, "mp3" | "aac"),
+            no_split,
             no_individual: cfg.no_individual,
             overwrite: cfg.overwrite,
             pattern: cfg.pattern.clone(),
@@ -97,7 +105,7 @@ impl Recorder {
             show_path,
             show_bytes: 0,
             bitrate_kbps: bitrate_kbps.max(1),
-            no_cue: cfg.no_cue,
+            no_cue: cfg.no_cue || !matches!(ext, "mp3" | "aac"),
             cue_entries: Vec::new(),
             cur: None,
             completed: 0,
@@ -108,6 +116,10 @@ impl Recorder {
 
     /// New `StreamTitle`: finalize the previous track and start a new one.
     pub fn on_title(&mut self, title: &str) -> io::Result<()> {
+        // Whole-capture formats (FLAC) are never split: keep the single track.
+        if self.no_split && self.cur.is_some() {
+            return Ok(());
+        }
         let changed = match &self.cur {
             Some(t) => t.title != title,
             None => true,

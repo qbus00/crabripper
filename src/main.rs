@@ -111,8 +111,19 @@ fn run(cfg: &Config) -> Result<(), String> {
         None
     };
 
-    let mut rec = recorder::Recorder::new(cfg, &info.name, &info.ext, info.bitrate.unwrap_or(128))
-        .map_err(|e| e.to_string())?;
+    // FLAC/Ogg specifics: native FLAC -> .flac; FLAC carried in Ogg -> .oga
+    // (detected by sniffing the first bytes). FLAC is captured whole (never split).
+    let mut ext = info.ext.clone();
+    let mut no_split = ext == "flac";
+    if ext == "ogg" && leftover_has_flac(&leftover) {
+        ext = "oga".to_string();
+        no_split = true;
+        say("Ogg stream carries FLAC -> .oga (captured whole)");
+    }
+
+    let mut rec =
+        recorder::Recorder::new(cfg, &info.name, &ext, info.bitrate.unwrap_or(128), no_split)
+            .map_err(|e| e.to_string())?;
     let mut src = source::Source::new(conn, leftover);
 
     let start = Instant::now();
@@ -183,4 +194,10 @@ fn run(cfg: &Config) -> Result<(), String> {
         total / 1024
     ));
     Ok(())
+}
+
+/// Sniff the first bytes of an Ogg body for the FLAC signature (FLAC-in-Ogg).
+fn leftover_has_flac(b: &[u8]) -> bool {
+    let n = b.len().min(64);
+    b[..n].windows(4).any(|w| w == b"FLAC")
 }

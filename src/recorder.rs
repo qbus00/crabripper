@@ -119,8 +119,13 @@ impl Recorder {
             };
             root.push(component(&base, "", None));
         }
+        // incomplete/ only holds individual track files: none with -A.
         let incomplete = root.join("incomplete");
-        fs::create_dir_all(&incomplete)?;
+        fs::create_dir_all(if cfg.no_individual {
+            &root
+        } else {
+            &incomplete
+        })?;
         let log_path = if cfg.log {
             Some(root.join("played.log"))
         } else {
@@ -986,6 +991,25 @@ mod tests {
         let size = |p: &str| fs::metadata(dir.join(p)).unwrap().len();
         assert_eq!(size("Show.mp3"), pos as u64);
         assert_eq!(size("incomplete/A - B.mp3"), pos as u64);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// -A (show file only) writes no tracks, so no incomplete/ either.
+    #[test]
+    fn show_only_makes_no_incomplete_dir() {
+        let dir = tmpdir("showonly");
+        let c = Config {
+            single_file: true,
+            single_file_name: Some("Show".into()),
+            no_individual: true,
+            ..cfg(&dir)
+        };
+        let mut r = Recorder::new(&c, "s", "mp3", 64, false).unwrap();
+        r.on_title("A - B").unwrap();
+        r.write_audio(&MP3[..3000]).unwrap();
+        r.finish().unwrap();
+        assert!(dir.join("Show.mp3").exists());
+        assert!(!dir.join("incomplete").exists());
         fs::remove_dir_all(&dir).ok();
     }
 

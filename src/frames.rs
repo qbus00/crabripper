@@ -112,6 +112,27 @@ pub fn frames(data: &[u8], ext: &str) -> Vec<(usize, usize)> {
     out
 }
 
+/// Length of the unfinished frame at the end of `data` (a recording stopped
+/// mid-frame), or 0. Conservative: only the start of a single frame following
+/// a chain of complete frames counts; anything else (an ID3 tag, a chain
+/// broken by a reconnect) is kept.
+pub fn partial_tail(data: &[u8], ext: &str) -> usize {
+    let Some(&(pos, len)) = frames(data, ext).last() else {
+        return 0;
+    };
+    let rest = &data[pos + len..];
+    let header = if ext == "aac" { 7 } else { 4 };
+    let unfinished = match frame_len(rest, ext) {
+        Some(n) => n > rest.len(),
+        None => !rest.is_empty() && rest.len() < header && rest[0] == 0xFF,
+    };
+    if unfinished {
+        rest.len()
+    } else {
+        0
+    }
+}
+
 /// Does a decoder packet of `packet_len` bytes correspond to a frame of
 /// `frame_len` bytes? mp3 packets are whole frames; ADTS packets exclude the
 /// 7-byte header (9 with CRC).
@@ -137,6 +158,21 @@ mod tests {
             junk.extend_from_slice(&data[start..]);
             assert_eq!(first_frame(&junk, ext), Some(5), "{ext}");
             assert!(frames(data, ext).len() > 20, "{ext}");
+        }
+    }
+
+    #[test]
+    fn partial_tail_trims_only_an_unfinished_frame() {
+        for (data, ext) in [(MP3, "mp3"), (AAC, "aac")] {
+            let fr = frames(data, ext);
+            let (pos, len) = fr[fr.len() / 2];
+            assert_eq!(partial_tail(&data[..pos + len], ext), 0, "{ext}");
+            assert_eq!(partial_tail(&data[..pos + 2], ext), 2, "{ext}");
+            assert_eq!(partial_tail(&data[..pos + len / 2], ext), len / 2, "{ext}");
+            // an HLS ID3 timestamp tag after the last frame is not audio
+            let mut tagged = data[..pos].to_vec();
+            tagged.extend_from_slice(b"ID3\x04\x00\x00\x00\x00\x00\x3fPRIV");
+            assert_eq!(partial_tail(&tagged, ext), 0, "{ext}");
         }
     }
 }

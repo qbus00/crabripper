@@ -121,7 +121,8 @@ everything crabripper reads, so it is built to fail safe:
   short tail in memory.
 - **Audio is on disk as it arrives** in every mode, so a crash or `kill`
   loses nothing already received; network errors reconnect instead of ending
-  the run.
+  the run. When a run stops (`-l`, Ctrl-C), the unfinished last mp3/aac frame
+  is trimmed so files end cleanly.
 - **Safe names**: stream titles are sanitized (no `/`, `..`, control chars),
   length-limited to fit filesystems, and never written through symlinks;
   cue sheets, logs, relay headers and the terminal never get raw control

@@ -16,7 +16,7 @@
 
 use crate::cli::{Config, Overwrite, Xs};
 use crate::util::{now_stamp, printable, sanitize, truncate_utf8};
-use crate::{cue, decode, id3, split};
+use crate::{cue, decode, frames, id3, split};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
@@ -35,6 +35,9 @@ const SYNC_MARGIN: usize = 32 * 1024;
 /// grow the sheet (it is rewritten on every entry).
 const MAX_CUE_TRACKS: usize = 99;
 const MAX_CUE_TITLE: usize = 255;
+/// Stream tail kept to find the unfinished last frame at finish (well above
+/// the largest mp3/ADTS frame).
+const TAIL_MAX: usize = 32 * 1024;
 
 struct Track {
     title: String,
@@ -43,6 +46,7 @@ struct Track {
     file: Option<File>,
     proper_start: bool,
     bytes: u64, // bytes in `file` (tag + audio)
+    audio: u64, // stream bytes in `file` (no tags)
 }
 
 pub struct Recorder {
@@ -92,6 +96,8 @@ pub struct Recorder {
     xs_offset_bytes: isize,
     hold: usize,   // silence tail size kept in memory
     ring: Vec<u8>, // tail of the current track's audio
+
+    tail: Vec<u8>, // last stream bytes (mp3/aac), to trim an unfinished frame
 }
 
 impl Recorder {
@@ -204,6 +210,7 @@ impl Recorder {
             xs_offset_bytes,
             hold,
             ring: Vec::new(),
+            tail: Vec::new(),
         })
     }
 
@@ -277,6 +284,7 @@ impl Recorder {
                 file: None,
                 proper_start,
                 bytes: 0,
+                audio: 0,
             });
             return Ok(());
         }
@@ -308,6 +316,7 @@ impl Recorder {
             file,
             proper_start,
             bytes,
+            audio: 0,
         });
         if !carry.is_empty() {
             self.write_track(&carry)?;
@@ -361,6 +370,13 @@ impl Recorder {
     }
 
     pub fn write_audio(&mut self, data: &[u8]) -> io::Result<()> {
+        if self.mp3like {
+            self.tail.extend_from_slice(data);
+            if self.tail.len() > 2 * TAIL_MAX {
+                let excess = self.tail.len() - TAIL_MAX;
+                self.tail.drain(..excess);
+            }
+        }
         if let Some(show) = &mut self.show {
             show.write_all(data)?;
             self.show_bytes += data.len() as u64;
@@ -393,6 +409,7 @@ impl Recorder {
             if let Some(f) = &mut t.file {
                 f.write_all(data)?;
                 t.bytes += data.len() as u64;
+                t.audio += data.len() as u64;
             }
         }
         if self.silence {
@@ -446,6 +463,26 @@ impl Recorder {
         }
         if !self.no_individual && self.cur.is_none() && !self.preamble.is_empty() {
             self.roll("", false)?;
+        }
+        // A stop (-l, Ctrl-C, end of stream) rarely lands on a frame boundary:
+        // drop the unfinished last frame so decoders don't hit a broken one.
+        let cut = if self.mp3like {
+            frames::partial_tail(&self.tail, &self.ext) as u64
+        } else {
+            0
+        };
+        if cut > 0 {
+            if let Some(show) = &mut self.show {
+                self.show_bytes -= cut; // the tail is part of what it holds
+                show.set_len(self.show_bytes)?;
+            }
+            if let Some(t) = self.cur.as_mut().filter(|t| t.audio >= cut) {
+                if let Some(f) = &mut t.file {
+                    t.bytes -= cut;
+                    t.audio -= cut;
+                    f.set_len(t.bytes)?;
+                }
+            }
         }
         if let Some(t) = &mut self.cur {
             if let Some(f) = &mut t.file {
@@ -926,6 +963,29 @@ mod tests {
                 .components()
                 .all(|c| !matches!(c, std::path::Component::ParentDir)));
         }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Stopping mid-frame leaves no unfinished frame at the end of the show
+    /// or of the in-progress track.
+    #[test]
+    fn finish_drops_unfinished_frame() {
+        let dir = tmpdir("tail");
+        let c = Config {
+            single_file: true,
+            single_file_name: Some("Show".into()),
+            ..cfg(&dir)
+        };
+        let mut r = Recorder::new(&c, "s", "mp3", 64, false).unwrap();
+        r.no_id3 = true;
+        let fr = frames::frames(MP3, "mp3");
+        let (pos, len) = fr[fr.len() - 2];
+        r.on_title("A - B").unwrap();
+        r.write_audio(&MP3[..pos + len / 2]).unwrap();
+        r.finish().unwrap();
+        let size = |p: &str| fs::metadata(dir.join(p)).unwrap().len();
+        assert_eq!(size("Show.mp3"), pos as u64);
+        assert_eq!(size("incomplete/A - B.mp3"), pos as u64);
         fs::remove_dir_all(&dir).ok();
     }
 

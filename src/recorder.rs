@@ -120,7 +120,11 @@ impl Recorder {
 
         let (show, show_path) = if cfg.single_file {
             let name = match &cfg.single_file_name {
-                Some(n) if n.contains('.') => n.clone(),
+                // Append the stream's extension unless the name already ends with
+                // exactly that extension (so `-a show.aac` on an AAC stream stays
+                // `show.aac`, but `-a Krakow.2026-10-24` becomes `...mp3`). Matching
+                // on any `.` would wrongly treat a dotted date as an extension.
+                Some(n) if ends_with_ext(n, ext) => n.clone(),
                 Some(n) => format!("{n}.{ext}"),
                 None => format!("sr_{}.{ext}", now_stamp()),
             };
@@ -576,6 +580,14 @@ fn write_wav_file(path: &Path, raw: &[u8], ext: &str) -> io::Result<u64> {
 
 /// Encode a filename component in the filesystem codeset (`--codeset-filesys`).
 /// Without a codeset (or off Unix) the UTF-8 name is used as-is.
+/// Does `name` already end with `.<ext>` (case-insensitive)? Used to avoid
+/// double-suffixing a single-file (`-a`) name that already carries its extension.
+fn ends_with_ext(name: &str, ext: &str) -> bool {
+    name.len() > ext.len()
+        && name.as_bytes()[name.len() - ext.len() - 1] == b'.'
+        && name[name.len() - ext.len()..].eq_ignore_ascii_case(ext)
+}
+
 fn fs_component(name: String, codeset: Option<&str>) -> std::ffi::OsString {
     match codeset {
         Some(cs) => {
@@ -629,4 +641,20 @@ fn apply_pattern(pattern: &str, title: &str, seqno: u32) -> String {
         }
     }
     sanitize(&out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ends_with_ext;
+
+    #[test]
+    fn single_file_extension_rules() {
+        // dotted date must still get the stream extension appended
+        assert!(!ends_with_ext("Krakow.2026-10-24_Sat_113130", "mp3"));
+        // name already carrying the right extension is left alone
+        assert!(ends_with_ext("Trojka.2026-10-24.aac", "aac"));
+        assert!(ends_with_ext("show.MP3", "mp3")); // case-insensitive
+        assert!(!ends_with_ext("show.aac", "mp3")); // wrong extension -> append
+        assert!(!ends_with_ext("mp3", "mp3")); // no dot
+    }
 }

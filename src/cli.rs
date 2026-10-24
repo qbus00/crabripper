@@ -109,7 +109,7 @@ pub struct Config {
     pub split_size: Option<u64>, // --split-size=MB: force a new track every N MB
     pub config: Option<String>,  // -C / --config=FILE
 
-    // codeset (accepted; conversion is a planned enhancement)
+    // codeset conversion (encoding_rs)
     pub codeset_filesys: Option<String>,
     pub codeset_id3: Option<String>,
     pub codeset_metadata: Option<String>,
@@ -139,7 +139,7 @@ impl Default for Config {
             proxy: None,
             interface: None,
             http10: false,
-            ssl_verify: false,
+            ssl_verify: true,
             relay_port: None,
             relay_ip: None,
             max_relay: 1,
@@ -263,8 +263,11 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             "-R" => c.max_relay = parse_u32(&next(&mut i, "-R")?, "-R")?,
             "-L" => c.relay_playlist = Some(next(&mut i, "-L")?),
             "-z" => c.no_port_scan = true,
-            "-p" => c.proxy = Some(next(&mut i, "-p")?),
+            // Not implemented: refuse rather than silently connect directly.
+            "-p" => return Err("-p (HTTP proxy) is not supported by crabripper".to_string()),
             "-o" => c.overwrite = parse_overwrite(&next(&mut i, "-o")?)?,
+            // Already the behaviour: tracks in incomplete/ are never overwritten
+            // (new names are versioned) unless -T.
             "-t" => c.no_overwrite_incomplete = true,
             "-c" => c.no_reconnect = true,
             "-l" => c.length = Some(parse_length(&next(&mut i, "-l")?)?),
@@ -280,7 +283,12 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             }
             "-u" => c.user_agent = next(&mut i, "-u")?,
             "-w" => c.rulefile = Some(next(&mut i, "-w")?),
-            "-m" => c.timeout = parse_u64(&next(&mut i, "-m")?, "-m")?,
+            "-m" => {
+                c.timeout = parse_u64(&next(&mut i, "-m")?, "-m")?;
+                if c.timeout == 0 {
+                    return Err("-m expects a timeout of at least 1 second".to_string());
+                }
+            }
             "-k" => c.keep_incomplete = Some(parse_u32(&next(&mut i, "-k")?, "-k")?),
             "-I" => c.interface = Some(next(&mut i, "-I")?),
             "-T" => c.truncate_dup = true,
@@ -423,7 +431,11 @@ pub fn parse_length(s: &str) -> Result<u64, String> {
                 0,
             ),
         };
-        return Ok(h * 3600 + m * 60 + sec);
+        return h
+            .checked_mul(3600)
+            .and_then(|v| v.checked_add(m.checked_mul(60)?))
+            .and_then(|v| v.checked_add(sec))
+            .ok_or_else(|| format!("-l value too large: {s:?}"));
     }
     let (num, mult) = match s.chars().last() {
         Some('s') | Some('S') => (&s[..s.len() - 1], 1),
@@ -433,8 +445,9 @@ pub fn parse_length(s: &str) -> Result<u64, String> {
     };
     num.trim()
         .parse::<u64>()
-        .map(|n| n * mult)
-        .map_err(|_| format!("bad -l value: {s:?}"))
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .ok_or_else(|| format!("bad -l value: {s:?}"))
 }
 
 pub fn print_usage() {
@@ -451,7 +464,7 @@ Opts: -h             - Print this listing
       -R #connect    - Max connections to relay, default 1, -R 0 is no limit
       -L file        - Create a relay playlist file
       -z             - Don't scan for free ports if base port is not avail
-      -p url         - Use HTTP proxy server at <url>
+      -p url         - (not supported: HTTP proxy)
       -o (always|never|larger|version) - When to write tracks in complete
       -t             - Don't overwrite tracks in incomplete
       -c             - Don't auto-reconnect
@@ -475,7 +488,7 @@ Opts: -h             - Print this listing
       --wav          - Decode tracks and write .wav files
       --no-cue       - Don't write .cue sheet files
 TLS opts:
-      --ssl-verify / --no-ssl-verify   - Verify the TLS cert (default: off)
+      --ssl-verify / --no-ssl-verify   - Verify the TLS cert (default: on)
 ID3 opts (mp3/aac):
       -i                      - Don't add any ID3 tags
       --with-id3v1            - Add ID3V1 tags
@@ -552,6 +565,27 @@ mod tests {
         assert_eq!(c.relay_ip.as_deref(), Some("127.0.0.1"));
         assert_eq!(c.max_relay, 0);
         matches!(c.hls_variant, HlsVariant::Bitrate(128000));
+    }
+
+    #[test]
+    fn rejects_bad_limits() {
+        assert!(parse_length("99999999999999999999h").is_err());
+        assert!(parse_length("18446744073709551615h").is_err());
+        let v = vec!["crabripper".into(), "url".into(), "-m".into(), "0".into()];
+        assert!(parse(v).is_err());
+        let v = vec![
+            "crabripper".into(),
+            "url".into(),
+            "-p".into(),
+            "http://p".into(),
+        ];
+        assert!(parse(v).is_err());
+    }
+
+    #[test]
+    fn tls_verified_by_default() {
+        assert!(cfg(&["url"]).ssl_verify);
+        assert!(!cfg(&["url", "--no-ssl-verify"]).ssl_verify);
     }
 
     #[test]

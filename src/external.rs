@@ -3,11 +3,24 @@
 //! becomes a new track title, delivered over a channel.
 
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 
-pub fn spawn(cmd: &str) -> std::io::Result<Receiver<String>> {
+/// Running `-E` command. Dropping it kills the child, so it never outlives us.
+pub struct External {
+    pub rx: Receiver<String>,
+    child: Child,
+}
+
+impl Drop for External {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+pub fn spawn(cmd: &str) -> std::io::Result<External> {
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(cmd)
@@ -47,8 +60,7 @@ pub fn spawn(cmd: &str) -> std::io::Result<Receiver<String>> {
                 break;
             }
         }
-        let _ = child.wait();
     });
 
-    Ok(rx)
+    Ok(External { rx, child })
 }

@@ -172,7 +172,7 @@ fn parse_vorbis_comment(packet: &[u8]) -> String {
         Some(v) => v as usize,
         None => return String::new(),
     };
-    pos += 4 + vlen;
+    pos = pos.saturating_add(4).saturating_add(vlen);
     let count = match rd(packet, pos) {
         Some(c) => c as usize,
         None => return String::new(),
@@ -185,7 +185,7 @@ fn parse_vorbis_comment(packet: &[u8]) -> String {
             None => break,
         };
         pos += 4;
-        if pos + len > packet.len() {
+        if pos.saturating_add(len) > packet.len() {
             break;
         }
         let comment = String::from_utf8_lossy(&packet[pos..pos + len]);

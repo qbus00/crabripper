@@ -1,10 +1,14 @@
 //! HLS (`.m3u8`) recording: follow a master playlist to a variant, then poll the
 //! media playlist and concatenate each new segment into one output file until the
-//! time limit or `#EXT-X-ENDLIST`. AES-128 encrypted segments are not yet handled.
+//! time limit or `#EXT-X-ENDLIST`. AES-128 encrypted segments are decrypted.
+//!
+//! Everything here comes from the server, so downloads are size/time bounded,
+//! the poll interval is clamped, and transient fetch failures are retried
+//! rather than ending a scheduled recording.
 
 use crate::cli::{Config, HlsVariant};
-use crate::http;
-use crate::util::{now_stamp, sanitize};
+use crate::http::{self, Limits};
+use crate::util::{now_stamp, printable, sanitize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
@@ -12,93 +16,158 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub fn rip(url: &str, cfg: &Config) -> Result<(), String> {
+const PLAYLIST: Limits = Limits {
+    max_bytes: 2 * 1024 * 1024,
+    max_time: Duration::from_secs(30),
+};
+const KEY: Limits = Limits {
+    max_bytes: 1024,
+    max_time: Duration::from_secs(30),
+};
+const SEGMENT: Limits = Limits {
+    max_bytes: 16 * 1024 * 1024,
+    max_time: Duration::from_secs(120),
+};
+/// Longest wait between playlist polls, whatever TARGETDURATION says.
+const MAX_POLL: u64 = 30;
+
+pub fn rip(url: &str, cfg: &Config, deadline: Option<Instant>) -> Result<(), String> {
     let say = |m: &str| {
         if !cfg.quiet {
             eprintln!("{m}");
         }
     };
+    let start = Instant::now();
 
     // Fetch the playlist; follow a master playlist to the chosen variant.
-    let first = http::fetch(url, cfg)?;
+    // Relative URIs resolve against the URL actually served (post-redirect).
+    let first = http::fetch(url, cfg, PLAYLIST)?;
     let text = String::from_utf8_lossy(&first.body).to_string();
     if !text.contains("#EXTM3U") {
         return Err("not an HLS playlist (missing #EXTM3U)".to_string());
     }
     let media_url = if text.contains("#EXT-X-STREAM-INF") {
         let v = pick_variant(&text, &cfg.hls_variant).ok_or("no variant in master playlist")?;
-        let resolved = resolve_url(url, &v);
-        say(&format!("HLS master -> variant: {resolved}"));
+        let resolved = resolve_url(&first.url, &v);
+        say(&format!("HLS master -> variant: {}", printable(&resolved)));
         resolved
     } else {
-        url.to_string()
+        first.url.clone()
     };
 
-    // Output: a single file.
+    // Output: a single file (overwritten, but never through a symlink).
     let outdir = PathBuf::from(cfg.output_dir.clone().unwrap_or_else(|| ".".to_string()));
     fs::create_dir_all(&outdir).map_err(|e| e.to_string())?;
     let name = match &cfg.single_file_name {
         Some(n) => n.clone(),
         None => format!("hls_{}.ts", now_stamp()),
     };
-    let path = outdir.join(sanitize(&name));
-    say(&format!("[hls file] {}", path.display()));
+    let name = sanitize(&name);
+    let path = outdir.join(if name.is_empty() {
+        "hls.ts".to_string()
+    } else {
+        name
+    });
+    say(&format!(
+        "[hls file] {}",
+        printable(&path.display().to_string())
+    ));
+    if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!(
+            "refusing to write through a symlink: {}",
+            printable(&path.display().to_string())
+        ));
+    }
     let mut file = File::create(&path).map_err(|e| e.to_string())?;
 
-    let start = Instant::now();
-    let deadline = cfg.length.map(|l| start + Duration::from_secs(l));
     let expired = || deadline.is_some_and(|d| Instant::now() >= d);
+    // Sleep `secs`, but never past the deadline.
+    let nap = |secs: u64| {
+        let mut d = Duration::from_secs(secs.clamp(1, MAX_POLL));
+        if let Some(dl) = deadline {
+            d = d.min(dl.saturating_duration_since(Instant::now()));
+        }
+        thread::sleep(d);
+    };
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut key_cache: HashMap<String, [u8; 16]> = HashMap::new();
     let mut total: u64 = 0;
     let mut nsegs: u64 = 0;
+    let mut skipped: u64 = 0;
 
     loop {
         if expired() {
             break;
         }
-        let mp = http::fetch(&media_url, cfg)?;
-        let mptext = String::from_utf8_lossy(&mp.body).to_string();
+        let (mptext, base) = match http::fetch(&media_url, cfg, PLAYLIST) {
+            Ok(mp) => (String::from_utf8_lossy(&mp.body).to_string(), mp.url),
+            Err(e) => {
+                if expired() {
+                    break;
+                }
+                // A blip on the playlist must not end a scheduled recording.
+                say(&format!("  ! HLS playlist fetch failed ({e}); retrying"));
+                nap(2);
+                continue;
+            }
+        };
         let target = parse_target_duration(&mptext).unwrap_or(3);
-        let entries = parse_media(&mptext)?; // errors on SAMPLE-AES / unsupported
+        let entries = parse_media(&mptext)?; // unsupported METHOD: cannot record at all
+        let current: HashSet<String> = entries.iter().map(|e| resolve_url(&base, &e.url)).collect();
+        let current_keys: HashSet<String> = entries
+            .iter()
+            .filter_map(|e| e.key.as_ref().map(|k| resolve_url(&base, &k.uri)))
+            .collect();
 
         let mut got_new = false;
         for entry in entries {
             if expired() {
                 break;
             }
-            let segurl = resolve_url(&media_url, &entry.url);
+            let segurl = resolve_url(&base, &entry.url);
             if !seen.insert(segurl.clone()) {
                 continue;
             }
-            let data = http::fetch(&segurl, cfg)?.body;
-            let out = match &entry.key {
+            // Any per-segment problem (fetch, key, decryption) loses that
+            // segment only, never the recording.
+            let seg = fetch_retry(&segurl, cfg, SEGMENT).and_then(|data| match &entry.key {
+                None => Ok(data),
                 Some(k) => {
-                    let key_url = resolve_url(&media_url, &k.uri);
+                    let key_url = resolve_url(&base, &k.uri);
                     let key = match key_cache.get(&key_url) {
                         Some(k) => *k,
                         None => {
-                            let kb = http::fetch(&key_url, cfg)?.body;
-                            if kb.len() != 16 {
-                                return Err(format!("HLS key is {} bytes, expected 16", kb.len()));
-                            }
-                            let mut arr = [0u8; 16];
-                            arr.copy_from_slice(&kb);
-                            key_cache.insert(key_url, arr);
-                            arr
+                            let key = fetch_key(&key_url, &base, cfg)?;
+                            key_cache.insert(key_url, key);
+                            key
                         }
                     };
                     let iv = k.iv.unwrap_or_else(|| iv_from_seq(entry.seq));
-                    aes128_cbc_decrypt(&key, &iv, &data).ok_or("HLS AES-128 decryption failed")?
+                    aes128_cbc_decrypt(&key, &iv, &data)
+                        .ok_or_else(|| "AES-128 decryption failed".to_string())
                 }
-                None => data,
+            });
+            let out = match seg {
+                Ok(out) => out,
+                Err(e) => {
+                    if expired() {
+                        break;
+                    }
+                    say(&format!("  ! HLS segment skipped ({})", printable(&e)));
+                    skipped += 1;
+                    continue;
+                }
             };
             file.write_all(&out).map_err(|e| e.to_string())?;
             total += out.len() as u64;
             nsegs += 1;
             got_new = true;
         }
+        // Only remember segments/keys still in the playlist window (bounded
+        // memory for 24/7 recordings).
+        seen.retain(|u| current.contains(u));
+        key_cache.retain(|u, _| current_keys.contains(u));
 
         if mptext.contains("#EXT-X-ENDLIST") {
             say("HLS: #EXT-X-ENDLIST (VOD end)");
@@ -107,7 +176,12 @@ pub fn rip(url: &str, cfg: &Config) -> Result<(), String> {
         if expired() {
             break;
         }
-        thread::sleep(Duration::from_secs(if got_new { 1 } else { target.max(1) }));
+        nap(if got_new { 1 } else { target });
+    }
+    if skipped > 0 {
+        say(&format!(
+            "  ! {skipped} HLS segment(s) could not be recorded"
+        ));
     }
 
     file.flush().map_err(|e| e.to_string())?;
@@ -117,6 +191,21 @@ pub fn rip(url: &str, cfg: &Config) -> Result<(), String> {
         total / 1024
     ));
     Ok(())
+}
+
+/// Fetch a 16-byte AES key. With certificate checks on, a key referenced from
+/// an https playlist must itself come over https (not in cleartext).
+fn fetch_key(key_url: &str, playlist: &str, cfg: &Config) -> Result<[u8; 16], String> {
+    if cfg.ssl_verify
+        && playlist.to_ascii_lowercase().starts_with("https://")
+        && !key_url.to_ascii_lowercase().starts_with("https://")
+    {
+        return Err("refusing to fetch an HLS key over plain http".to_string());
+    }
+    let kb = fetch_retry(key_url, cfg, KEY)?;
+    kb.as_slice()
+        .try_into()
+        .map_err(|_| format!("HLS key is {} bytes, expected 16", kb.len()))
 }
 
 #[derive(Clone)]
@@ -166,7 +255,7 @@ fn parse_media(mp: &str) -> Result<Vec<SegEntry>, String> {
                 seq,
                 key: key.clone(),
             });
-            seq += 1;
+            seq = seq.wrapping_add(1);
         }
     }
     Ok(out)
@@ -212,9 +301,22 @@ fn parse_attrs(s: &str) -> HashMap<String, String> {
     map
 }
 
+/// Fetch with one retry after a short pause (segments/keys are small and a
+/// single transient failure is common on CDNs).
+fn fetch_retry(url: &str, cfg: &Config, limits: Limits) -> Result<Vec<u8>, String> {
+    match http::fetch(url, cfg, limits) {
+        Ok(f) => Ok(f.body),
+        Err(_) => {
+            thread::sleep(Duration::from_secs(1));
+            http::fetch(url, cfg, limits).map(|f| f.body)
+        }
+    }
+}
+
 fn parse_hex_iv(v: &str) -> Option<[u8; 16]> {
     let h = v.trim().trim_start_matches("0x").trim_start_matches("0X");
-    if h.len() != 32 {
+    // ASCII hex only: byte-slicing below must never split a UTF-8 character.
+    if h.len() != 32 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut iv = [0u8; 16];
@@ -335,6 +437,14 @@ mod tests {
         assert_eq!(resolve_url(b, "seg1.ts"), "https://h.com/a/b/seg1.ts");
         assert_eq!(resolve_url(b, "/x/seg.ts"), "https://h.com/x/seg.ts");
         assert_eq!(resolve_url(b, "https://c/z.ts"), "https://c/z.ts");
+    }
+
+    #[test]
+    fn hex_iv_rejects_non_ascii() {
+        // 32 bytes, but multi-byte chars: must not panic on char boundaries
+        assert_eq!(parse_hex_iv("0xaa€€€€€€€€€€"), None);
+        let iv = parse_hex_iv("0x000102030405060708090A0B0C0D0E0F").unwrap();
+        assert_eq!(iv[15], 0x0f);
     }
 
     #[test]

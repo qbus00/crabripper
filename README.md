@@ -20,7 +20,7 @@ The C streamripper works well, but the Rust port gains:
 
 | Feature | Status |
 |---|---|
-| HTTP + HTTPS streams (TLS via rustls, verify off by default) | ✅ |
+| HTTP + HTTPS streams (TLS via rustls, certificates verified by default) | ✅ |
 | ICY inline metadata + track splitting | ✅ |
 | Output layout: per-stream subdir, `incomplete/`→complete lifecycle | ✅ |
 | Single-file (`-a`), no-individual (`-A`), overwrite modes (`-o`) | ✅ |
@@ -39,7 +39,7 @@ The C streamripper works well, but the Rust port gains:
 | Auto-reconnect on stream drop (`-c` to disable) | ✅ |
 | Metadata rulefiles (`-w`), external metadata (`-E`), interface bind (`-I`) | ✅ |
 | Charset conversion (`--codeset-metadata`/`-id3`/`-filesys`), `--debug`, `--stderr` | ✅ |
-| **`--ssl-verify`** enforced (real cert check, Mozilla roots) | ✅ |
+| TLS cert check against Mozilla roots (default on; `--no-ssl-verify` to skip) | ✅ |
 | **Extras:** `--log` (played.log), `--split-time`/`--split-size`, `-C`/`--config`, `-T` | ✅ |
 
 Verified live against real stations (Polish public radio over http/https, SomaFM,
@@ -109,6 +109,26 @@ linker for the static musl target). Install once: `brew install zig && cargo ins
 plus `rustup target add x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl`.
 Each target also gets a `.tar.gz` (inner binary named `crabripper`) for Homebrew.
 
+## Robustness & security
+
+Stream servers (and, for plain http, anyone on the network path) control
+everything crabripper reads, so it is built to fail safe:
+
+- **No `unsafe` code**; decoder calls are panic-isolated.
+- **Bounded memory and time** from remote input: `icy-metaint` is validated,
+  HLS playlists/keys/segments are size- and time-limited, the HLS poll interval
+  is clamped so `-l` is always honoured, and silence splitting keeps only a
+  short tail in memory.
+- **Audio is on disk as it arrives** in every mode, so a crash or `kill`
+  loses nothing already received; network errors reconnect instead of ending
+  the run.
+- **Safe names**: stream titles are sanitized (no `/`, `..`, control chars),
+  length-limited to fit filesystems, and never written through symlinks;
+  cue sheets, logs, relay headers and the terminal never get raw control
+  characters.
+- **TLS certificates are verified by default.**
+- **Relay**: slow listeners are dropped rather than allowed to stall recording.
+
 ## Usage
 
 ```sh
@@ -128,7 +148,7 @@ Common options (run `-h` for the full streamripper-compatible list):
 | `-u agent` | custom User-Agent |
 | `--wav` | decode mp3 tracks to `.wav` |
 | `--no-cue` / `-i` | no cue sheet / no ID3 tags |
-| `--ssl-verify` | verify TLS cert (off by default, like the C fork) |
+| `--no-ssl-verify` | skip TLS certificate checks (verification is on by default) |
 
 ```sh
 # examples

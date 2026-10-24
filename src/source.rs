@@ -1,21 +1,20 @@
-//! Buffered reader over a `Conn` that can also carry bytes already read while
-//! parsing the HTTP response header.
+//! Buffered reader over a response body (already-read header leftovers, the
+//! socket, de-chunked if needed).
 
-use crate::conn::Conn;
-use std::io;
-use std::io::Read;
+use crate::http::Body;
+use std::io::{self, Read};
 
 pub struct Source {
-    conn: Conn,
+    body: Body,
     buf: Vec<u8>,
     pos: usize,
 }
 
 impl Source {
-    pub fn new(conn: Conn, leftover: Vec<u8>) -> Self {
+    pub fn new(body: Body) -> Self {
         Source {
-            conn,
-            buf: leftover,
+            body,
+            buf: Vec::new(),
             pos: 0,
         }
     }
@@ -26,7 +25,7 @@ impl Source {
             return Ok(true);
         }
         let mut tmp = [0u8; 16384];
-        let n = self.conn.read(&mut tmp)?;
+        let n = self.body.read(&mut tmp)?;
         if n == 0 {
             return Ok(false);
         }
@@ -36,10 +35,27 @@ impl Source {
         Ok(true)
     }
 
-    /// Read exactly `n` bytes into `out`. Returns false if EOF hit first.
+    /// Look at up to `n` upcoming bytes without consuming them (fewer at EOF).
+    pub fn peek(&mut self, n: usize) -> io::Result<&[u8]> {
+        while self.buf.len() - self.pos < n {
+            let mut tmp = [0u8; 4096];
+            let k = self.body.read(&mut tmp)?;
+            if k == 0 {
+                break;
+            }
+            self.buf.extend_from_slice(&tmp[..k]);
+        }
+        let end = (self.pos + n).min(self.buf.len());
+        Ok(&self.buf[self.pos..end])
+    }
+
+    /// Read exactly `n` bytes into `out`. Returns false if EOF hit first, in
+    /// which case `out` holds the partial data that did arrive.
     pub fn read_exact_n(&mut self, n: usize, out: &mut Vec<u8>) -> io::Result<bool> {
         out.clear();
-        out.reserve(n);
+        // `n` can come from the server (icy-metaint); it is validated upstream,
+        // but never let it size an allocation up front.
+        out.reserve(n.min(64 * 1024));
         while out.len() < n {
             if !self.fill()? {
                 return Ok(false);

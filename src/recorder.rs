@@ -8,22 +8,41 @@
 //!
 //! ID3 tags (v2.3 prepended to mp3/aac tracks, optional v1 appended) and cue
 //! sheets for single-file (`-a`) recordings are written here too.
+//!
+//! Audio always goes to disk as it arrives; memory use is bounded. The
+//! silence splitpoint keeps only a short tail of the current track in memory:
+//! when the cut lands before the metadata boundary, the overshoot is truncated
+//! from the finished track's file and carried into the next one.
 
 use crate::cli::{Config, Overwrite, Xs};
-use crate::util::{now_stamp, sanitize};
-use crate::{cue, decode, id3, split, wav};
+use crate::util::{now_stamp, printable, sanitize, truncate_utf8};
+use crate::{cue, decode, id3, split};
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Longest filename we generate: 255-byte NAME_MAX minus room for a
+/// " (9999)" de-dup suffix.
+const NAME_BUDGET: usize = 255 - 8;
+/// Audio held while waiting for the first title, so it can join that track.
+/// Must exceed the largest metadata interval we accept.
+const PREAMBLE_MAX: usize = 2 * 1024 * 1024;
+/// Extra bytes kept in the silence tail so the decoder can find frame sync.
+const SYNC_MARGIN: usize = 32 * 1024;
+/// The cue format allows 99 tracks; titles are bounded so a title flood can't
+/// grow the sheet (it is rewritten on every entry).
+const MAX_CUE_TRACKS: usize = 99;
+const MAX_CUE_TITLE: usize = 255;
+
 struct Track {
     title: String,
-    path: PathBuf, // in incomplete/
+    path: PathBuf,        // in incomplete/ (the .wav path in --wav mode)
+    src: Option<PathBuf>, // --wav: encoded bytes on disk, decoded at finalize
     file: Option<File>,
-    raw: Vec<u8>, // buffered encoded bytes, used in --wav mode
     proper_start: bool,
-    bytes: u64,
+    bytes: u64, // bytes in `file` (tag + audio)
 }
 
 pub struct Recorder {
@@ -63,16 +82,16 @@ pub struct Recorder {
     completed: u32,
     seen: u32,
     kept: u32,
+    titled: bool,      // a real (non-empty) title has been seen
+    preamble: Vec<u8>, // audio before the first title (bounded)
 
-    // silence-based splitpoint (mp3, individual, --xs != none)
+    // silence-based splitpoint (mp3/aac, individual tracks, --xs != none)
     silence: bool,
     xs_pre: usize,
     xs_post: usize,
     xs_offset_bytes: isize,
-    pend: Vec<u8>,
-    pend_title: String,
-    pend_started: bool,
-    pend_proper: bool,
+    hold: usize,   // silence tail size kept in memory
+    ring: Vec<u8>, // tail of the current track's audio
 }
 
 impl Recorder {
@@ -85,13 +104,14 @@ impl Recorder {
     ) -> io::Result<Self> {
         let mut root = PathBuf::from(cfg.output_dir.clone().unwrap_or_else(|| ".".to_string()));
         if !cfg.no_subdir {
+            // The stream name comes from the server (icy-name).
             let base = sanitize(stream_name);
             let base = if base.is_empty() {
                 "Crabripper_rips".to_string()
             } else {
                 base
             };
-            root.push(base);
+            root.push(component(&base, "", None));
         }
         let incomplete = root.join("incomplete");
         fs::create_dir_all(&incomplete)?;
@@ -113,10 +133,16 @@ impl Recorder {
             && cfg.xs != Xs::None
             && !wav
             && !no_split;
-        let bpms = (bitrate_kbps.max(1) as usize / 8).max(1); // bytes per millisecond
+        // icy-br is server-supplied: clamp it before it sizes anything.
+        let bitrate_kbps = bitrate_kbps.clamp(8, 2000);
+        let bpms = (bitrate_kbps as usize / 8).max(1); // bytes per millisecond
+        let ms = |v: i32| (v.clamp(1, 30_000)) as usize;
         let (pre_ms, post_ms) = cfg.xs_search_window;
-        let pre_ms = if pre_ms > 0 { pre_ms } else { 1500 };
-        let post_ms = if post_ms > 0 { post_ms } else { 1500 };
+        let pre_ms = if pre_ms > 0 { ms(pre_ms) } else { 1500 };
+        let post_ms = if post_ms > 0 { ms(post_ms) } else { 1500 };
+        let xs_pre = pre_ms * bpms;
+        let xs_offset_bytes = cfg.xs_offset.clamp(-30_000, 30_000) as isize * bpms as isize;
+        let hold = xs_pre + xs_offset_bytes.min(0).unsigned_abs() + SYNC_MARGIN;
 
         let (show, show_path) = if cfg.single_file {
             let name = match &cfg.single_file_name {
@@ -132,8 +158,8 @@ impl Recorder {
                 sanitize(&name),
                 cfg.codeset_filesys.as_deref(),
             ));
-            eprintln!("[show file] {}", path.display());
-            (Some(File::create(&path)?), Some(path))
+            eprintln!("[show file] {}", printable(&path.display().to_string()));
+            (Some(create_show(&path)?), Some(path))
         } else {
             (None, None)
         };
@@ -158,26 +184,26 @@ impl Recorder {
             truncate_dup: cfg.truncate_dup,
             log_path,
             split_time: cfg.split_time.map(Duration::from_secs),
-            split_size: cfg.split_size.map(|mb| mb * 1024 * 1024),
+            split_size: cfg.split_size.map(|mb| mb.saturating_mul(1024 * 1024)),
             cur_start: Instant::now(),
             show,
             show_path,
             show_bytes: 0,
-            bitrate_kbps: bitrate_kbps.max(1),
+            bitrate_kbps,
             no_cue: cfg.no_cue || !matches!(ext, "mp3" | "aac"),
             cue_entries: Vec::new(),
             cur: None,
             completed: 0,
             seen: 0,
             kept: 0,
+            titled: false,
+            preamble: Vec::new(),
             silence,
-            xs_pre: pre_ms as usize * bpms,
-            xs_post: post_ms as usize * bpms,
-            xs_offset_bytes: cfg.xs_offset as isize * bpms as isize,
-            pend: Vec::new(),
-            pend_title: String::new(),
-            pend_started: false,
-            pend_proper: false,
+            xs_pre,
+            xs_post: post_ms * bpms,
+            xs_offset_bytes,
+            hold,
+            ring: Vec::new(),
         })
     }
 
@@ -187,83 +213,151 @@ impl Recorder {
         if self.no_split && self.cur.is_some() {
             return Ok(());
         }
-        if self.silence {
-            return self.handle_silence_title(title);
-        }
-        let changed = match &self.cur {
-            Some(t) => t.title != title,
-            None => true,
-        };
-        if !changed {
+        // Servers re-send the current title (periodically, and on every
+        // reconnect): that is not a track change.
+        if self.cur.as_ref().is_some_and(|t| t.title == title) {
             return Ok(());
         }
-        self.roll_track(title)
+        self.roll(title, self.silence)
     }
 
     /// Finalize the current track and start a new one unconditionally. Used by
     /// the Ogg path (every logical-stream boundary is a real new track, even if
     /// two consecutive tracks share a title).
     pub fn roll_track(&mut self, title: &str) -> io::Result<()> {
+        self.roll(title, false)
+    }
+
+    /// Start a new track. With `search`, the cut is moved to the quietest frame
+    /// near the boundary (silence splitpoint).
+    fn roll(&mut self, title: &str, search: bool) -> io::Result<()> {
         self.note_title(title);
+        let carry = if search {
+            self.silence_cut()?
+        } else {
+            Vec::new()
+        };
+        // A track starts "properly" (i.e. can be complete) only at a boundary we
+        // witnessed: not the stream's first title — that song was already
+        // playing when we joined — and not the initial untitled audio.
+        let proper_start = if title.is_empty() {
+            self.cur.is_some()
+        } else {
+            self.titled
+        };
+        if !title.is_empty() {
+            self.titled = true;
+        }
         if let Some(prev) = self.cur.take() {
             self.finalize(prev)?;
         }
         self.seen += 1;
-        let proper_start = self.seen > 1;
 
         // Cue entry for the single-file show: this track starts at the current
-        // position in the show file.
-        if self.show.is_some() && !self.no_cue && !title.is_empty() {
-            let sec = self.show_bytes * 8 / (self.bitrate_kbps as u64 * 1000);
-            self.cue_entries.push((title.to_string(), sec));
+        // position in the show file (minus any audio carried back by the cut).
+        if self.show.is_some()
+            && !self.no_cue
+            && !title.is_empty()
+            && self.cue_entries.len() < MAX_CUE_TRACKS
+        {
+            let pos = self.show_bytes.saturating_sub(carry.len() as u64);
+            let sec = pos * 8 / (self.bitrate_kbps as u64 * 1000);
+            let t = truncate_utf8(title, MAX_CUE_TITLE).to_string();
+            self.cue_entries.push((t, sec));
+            self.write_cue(false)?;
         }
 
+        self.ring.clear();
         if self.no_individual {
             // still track boundaries (for the show file / cue sheet)
             self.cur = Some(Track {
                 title: title.to_string(),
                 path: PathBuf::new(),
+                src: None,
                 file: None,
-                raw: Vec::new(),
                 proper_start,
                 bytes: 0,
             });
+            return Ok(());
+        }
+
+        let base = sanitize(title);
+        let fallback = format!("track_{:03}", self.seen);
+        let base = if base.is_empty() {
+            fallback.clone()
         } else {
-            let base = sanitize(title);
-            let base = if base.is_empty() {
-                format!("track_{:03}", self.seen)
-            } else {
-                base
-            };
-            let tx = self.track_ext();
-            let path = self.dedup_path(self.incomplete.join(fs_component(
-                format!("{base}.{tx}"),
-                self.codeset_filesys.as_deref(),
-            )));
-            let mut bytes = 0u64;
-            let file = if self.wav {
-                None // buffered as mp3, decoded to wav at finalize
-            } else {
-                let mut f = File::create(&path)?;
-                // Prepend ID3v2.3 to mp3/aac tracks (default on; never for wav).
-                if self.mp3like && !self.no_id3 && !self.without_id3v2 {
-                    let (artist, song) = id3::split_artist_title(title);
-                    let tag = id3::id3v2(artist, song, self.codeset_id3.as_deref());
-                    f.write_all(&tag)?;
-                    bytes += tag.len() as u64;
-                }
-                Some(f)
-            };
-            self.cur = Some(Track {
-                title: title.to_string(),
-                path,
-                file,
-                raw: Vec::new(),
-                proper_start,
-                bytes,
-            });
+            base
+        };
+        // A track file that cannot be created (odd filesystem limits, a stale
+        // file) costs that track's file, never the whole recording.
+        let made = self.new_track_file(title, &base).or_else(|e| {
+            eprintln!("  ! cannot create track file ({e}); using {fallback}");
+            self.new_track_file(title, &fallback)
+        });
+        let (path, file, src, bytes) = match made {
+            Ok((path, f, src, bytes)) => (path, Some(f), src, bytes),
+            Err(e) => {
+                eprintln!("  ! cannot create track file ({e}); this track is not saved");
+                (PathBuf::new(), None, None, 0)
+            }
+        };
+        self.cur = Some(Track {
+            title: title.to_string(),
+            path,
+            src,
+            file,
+            proper_start,
+            bytes,
+        });
+        if !carry.is_empty() {
+            self.write_track(&carry)?;
+        }
+        if !self.preamble.is_empty() {
+            let pre = std::mem::take(&mut self.preamble);
+            self.write_track(&pre)?;
         }
         Ok(())
+    }
+
+    /// Create the incomplete/ file for a new track: `(path, file, wav part
+    /// path, bytes written)`. In --wav mode the encoded audio goes to a `.part`
+    /// file that is decoded to `path` at finalize.
+    fn new_track_file(
+        &self,
+        title: &str,
+        base: &str,
+    ) -> io::Result<(PathBuf, File, Option<PathBuf>, u64)> {
+        let path = self.dedup_path(self.incomplete.join(component(
+            base,
+            self.track_ext(),
+            self.codeset_filesys.as_deref(),
+        )));
+        if self.wav {
+            let src = self.part_path(&path);
+            let f = self.open_track(&src)?;
+            return Ok((path, f, Some(src), 0));
+        }
+        let mut f = self.open_track(&path)?;
+        let mut bytes = 0u64;
+        // Prepend ID3v2.3 to mp3/aac tracks (default on; never for wav).
+        if self.mp3like && !self.no_id3 && !self.without_id3v2 {
+            let (artist, song) = id3::split_artist_title(title);
+            let tag = id3::id3v2(artist, song, self.codeset_id3.as_deref());
+            f.write_all(&tag)?;
+            bytes += tag.len() as u64;
+        }
+        Ok((path, f, None, bytes))
+    }
+
+    fn part_path(&self, wav_path: &Path) -> PathBuf {
+        wav_path.with_extension(format!("{}.part", self.ext))
+    }
+
+    /// Is this incomplete/ name in use (including, for --wav, its `.part`)?
+    /// `symlink_metadata` so a dangling symlink also counts as taken.
+    fn taken(&self, p: &Path) -> bool {
+        fs::symlink_metadata(p).is_ok()
+            || (self.wav && fs::symlink_metadata(self.part_path(p)).is_ok())
     }
 
     pub fn write_audio(&mut self, data: &[u8]) -> io::Result<()> {
@@ -271,34 +365,70 @@ impl Recorder {
             show.write_all(data)?;
             self.show_bytes += data.len() as u64;
         }
-        if self.silence {
-            // Buffer; tracks are cut at the quietest point on each boundary.
-            self.pend.extend_from_slice(data);
+        if self.no_individual {
             return Ok(());
         }
-        if !self.no_individual {
-            if self.cur.is_none() {
-                self.on_title("")?;
+        if self.cur.is_none() {
+            // Before the first title: hold the audio so it can join the first
+            // (partial) track; give up waiting once it grows too large.
+            self.preamble.extend_from_slice(data);
+            if self.preamble.len() > PREAMBLE_MAX {
+                self.roll("", false)?;
             }
-            let wav = self.wav;
-            let mut cur_bytes = 0u64;
-            if let Some(t) = &mut self.cur {
-                if wav {
-                    t.raw.extend_from_slice(data);
-                    t.bytes += data.len() as u64;
-                } else if let Some(f) = &mut t.file {
-                    f.write_all(data)?;
-                    t.bytes += data.len() as u64;
-                }
-                cur_bytes = t.bytes;
+            return Ok(());
+        }
+        self.write_track(data)?;
+        // --split-time / --split-size: force a new track (not for ogg/wav,
+        // which have their own boundaries).
+        let cur_bytes = self.cur.as_ref().map_or(0, |t| t.bytes);
+        if !self.wav && self.ext != "ogg" && self.should_split(cur_bytes) {
+            self.roll("", false)?;
+        }
+        Ok(())
+    }
+
+    /// Append to the current track's file (and the silence tail).
+    fn write_track(&mut self, data: &[u8]) -> io::Result<()> {
+        if let Some(t) = &mut self.cur {
+            if let Some(f) = &mut t.file {
+                f.write_all(data)?;
+                t.bytes += data.len() as u64;
             }
-            // --split-time / --split-size: force a new track (not for ogg/wav,
-            // which have their own boundaries).
-            if !wav && self.ext != "ogg" && self.should_split(cur_bytes) {
-                self.roll_track("")?;
+        }
+        if self.silence {
+            self.ring.extend_from_slice(data);
+            if self.ring.len() > 2 * self.hold {
+                let excess = self.ring.len() - self.hold;
+                self.ring.drain(..excess);
             }
         }
         Ok(())
+    }
+
+    /// Silence splitpoint: find the quietest frame near the end of the current
+    /// track, truncate the current file there, and return the bytes after the
+    /// cut (which belong to the next track).
+    fn silence_cut(&mut self) -> io::Result<Vec<u8>> {
+        let Some(f) = self.cur.as_mut().and_then(|t| t.file.as_mut()) else {
+            return Ok(Vec::new());
+        };
+        let len = self.ring.len();
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let boundary = (len as isize + self.xs_offset_bytes).clamp(0, len as isize) as usize;
+        let cut =
+            split::find_split(&self.ring, boundary, self.xs_pre, self.xs_post, &self.ext).min(len);
+        let carry = self.ring[cut..].to_vec();
+        if !carry.is_empty() {
+            let keep = f.metadata()?.len().saturating_sub(carry.len() as u64);
+            f.set_len(keep)?;
+            f.seek(SeekFrom::End(0))?;
+            if let Some(t) = &mut self.cur {
+                t.bytes = keep;
+            }
+        }
+        Ok(carry)
     }
 
     fn track_ext(&self) -> &str {
@@ -314,54 +444,34 @@ impl Recorder {
         if let Some(show) = &mut self.show {
             show.flush()?;
         }
+        if !self.no_individual && self.cur.is_none() && !self.preamble.is_empty() {
+            self.roll("", false)?;
+        }
         if let Some(t) = &mut self.cur {
             if let Some(f) = &mut t.file {
                 f.flush()?;
             }
-        }
-        // In --wav mode, write the in-progress last track (it stays in incomplete/).
-        if self.wav {
-            if let Some(t) = &self.cur {
-                if !t.raw.is_empty() {
-                    let _ = write_wav_file(&t.path, &t.raw, &self.ext);
-                }
+            // --wav: decode the in-progress last track (it stays in incomplete/).
+            if let Some(src) = t.src.take() {
+                drop(t.file.take());
+                wav_from_part(&src, &t.path, &self.ext);
             }
         }
-        // Silence mode: flush the in-progress last track to incomplete/.
-        if self.silence && !self.pend.is_empty() {
-            let title = std::mem::take(&mut self.pend_title);
-            let data = std::mem::take(&mut self.pend);
-            self.emit_silence_track(&title, false, &data)?;
-        }
-        // Cue sheet for the single-file show.
-        if !self.no_cue && !self.cue_entries.is_empty() {
-            if let Some(show_path) = &self.show_path {
-                let show_name = show_path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("show")
-                    .to_string();
-                let cue_path = show_path.with_extension("cue");
-                fs::write(&cue_path, cue::render(&show_name, &self.cue_entries))?;
-                eprintln!("[cue] {}", cue_path.display());
-            }
-        }
-        Ok(())
+        self.write_cue(true)
     }
 
     fn finalize(&mut self, mut prev: Track) -> io::Result<()> {
-        if self.wav {
-            // Decode the buffered mp3 to a .wav at the incomplete path.
-            if !prev.raw.is_empty() {
-                prev.bytes = write_wav_file(&prev.path, &prev.raw, &self.ext)?;
+        if let Some(src) = prev.src.take() {
+            drop(prev.file.take());
+            match wav_from_part(&src, &prev.path, &self.ext) {
+                Some(n) => prev.bytes = n,
+                None => return Ok(()), // decode failed: encoded file kept in incomplete/
             }
-        } else {
+        } else if self.mp3like && !self.no_id3 && self.with_id3v1 {
             // Append ID3v1 to mp3/aac tracks before closing, if requested.
-            if self.mp3like && !self.no_id3 && self.with_id3v1 {
-                if let Some(f) = &mut prev.file {
-                    let (artist, song) = id3::split_artist_title(&prev.title);
-                    f.write_all(&id3::id3v1(artist, song, self.codeset_id3.as_deref()))?;
-                }
+            if let Some(f) = &mut prev.file {
+                let (artist, song) = id3::split_artist_title(&prev.title);
+                f.write_all(&id3::id3v1(artist, song, self.codeset_id3.as_deref()))?;
             }
         }
         drop(prev.file.take()); // close the incomplete file
@@ -383,20 +493,68 @@ impl Recorder {
     /// Move a finalized track from `incomplete/` to the destination, applying the
     /// name pattern/sequence and overwrite mode.
     fn move_completed(&mut self, from: &Path, title: &str, bytes: u64) -> io::Result<()> {
-        let seqno = self.seq.map(|start| start + self.completed);
+        let seqno = self.seq.map(|start| start.saturating_add(self.completed));
         let base = self.dest_basename(title, seqno);
-        let dest = self.root.join(fs_component(
-            format!("{base}.{}", self.track_ext()),
+        let mut dest = self.root.join(component(
+            &base,
+            self.track_ext(),
             self.codeset_filesys.as_deref(),
         ));
-        match self.resolve_overwrite(&dest, bytes)? {
-            Some(final_dest) => {
-                move_file(from, &final_dest)?;
+        // A track named like the show being recorded (or its cue sheet) must
+        // never replace it, whatever -o says.
+        if self.is_show_file(&dest) {
+            dest = self.root.join(component(
+                &format!("{base} (track)"),
+                self.track_ext(),
+                self.codeset_filesys.as_deref(),
+            ));
+        }
+        let outcome = self.resolve_overwrite(&dest, bytes).and_then(|d| match d {
+            Some(final_dest) => move_file(from, &final_dest).map(|_| Some(final_dest)),
+            None => Ok(None),
+        });
+        match outcome {
+            Ok(Some(final_dest)) => {
                 self.completed += 1;
-                eprintln!("[track {:>3}] {}", self.completed, final_dest.display());
+                eprintln!(
+                    "[track {:>3}] {}",
+                    self.completed,
+                    printable(&final_dest.display().to_string())
+                );
             }
-            None => {
+            Ok(None) => {
                 let _ = fs::remove_file(from);
+            }
+            Err(e) => eprintln!(
+                "  ! could not complete {} ({e}); left in incomplete/",
+                printable(&from.display().to_string())
+            ),
+        }
+        Ok(())
+    }
+
+    fn is_show_file(&self, p: &Path) -> bool {
+        self.show_path
+            .as_ref()
+            .is_some_and(|s| p == s || p == s.with_extension("cue"))
+    }
+
+    /// Rewrite the cue sheet for the single-file show (called as entries are
+    /// added, so it survives an interrupted recording).
+    fn write_cue(&self, announce: bool) -> io::Result<()> {
+        if self.no_cue || self.cue_entries.is_empty() {
+            return Ok(());
+        }
+        if let Some(show_path) = &self.show_path {
+            let show_name = show_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("show")
+                .to_string();
+            let cue_path = show_path.with_extension("cue");
+            fs::write(&cue_path, cue::render(&show_name, &self.cue_entries))?;
+            if announce {
+                eprintln!("[cue] {}", printable(&cue_path.display().to_string()));
             }
         }
         Ok(())
@@ -410,7 +568,8 @@ impl Recorder {
         if let Some(p) = &self.log_path {
             if !title.is_empty() {
                 if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(p) {
-                    let _ = writeln!(f, "{}  {}", now_stamp(), title);
+                    // one line per title: no embedded newlines from the stream
+                    let _ = writeln!(f, "{}  {}", now_stamp(), printable(title));
                 }
             }
         }
@@ -418,7 +577,7 @@ impl Recorder {
 
     /// Without -T, avoid clobbering an existing incomplete file by versioning it.
     fn dedup_path(&self, path: PathBuf) -> PathBuf {
-        if self.truncate_dup || !path.exists() {
+        if self.truncate_dup || !self.taken(&path) {
             return path;
         }
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -431,11 +590,22 @@ impl Recorder {
                 format!("{stem} ({n}).{ext}")
             };
             let cand = dir.join(name);
-            if !cand.exists() {
+            if !self.taken(&cand) {
                 return cand;
             }
         }
         path
+    }
+
+    /// Create a track file in incomplete/: never follow a symlink. Without -T
+    /// the name was de-duplicated, so require it to be new (atomic O_EXCL).
+    fn open_track(&self, path: &Path) -> io::Result<File> {
+        if self.truncate_dup {
+            refuse_symlink(path)?;
+            File::create(path)
+        } else {
+            OpenOptions::new().write(true).create_new(true).open(path)
+        }
     }
 
     /// --split-time / --split-size: has the current track hit a forced boundary?
@@ -443,79 +613,6 @@ impl Recorder {
         self.split_time
             .is_some_and(|d| self.cur_start.elapsed() >= d)
             || self.split_size.is_some_and(|sz| cur_bytes >= sz)
-    }
-
-    // ---- silence-based splitpoint path (mp3) ----
-
-    fn handle_silence_title(&mut self, title: &str) -> io::Result<()> {
-        self.note_title(title);
-        if !self.pend_started {
-            // First title: the audio buffered so far is this (partial) first track.
-            self.seen += 1;
-            self.pend_title = title.to_string();
-            self.pend_started = true;
-            self.pend_proper = false;
-            return Ok(());
-        }
-        // A real boundary: cut the pending track at the quietest nearby frame.
-        let boundary = (self.pend.len() as isize + self.xs_offset_bytes)
-            .clamp(0, self.pend.len() as isize) as usize;
-        let cut = split::find_split(&self.pend, boundary, self.xs_pre, self.xs_post, &self.ext)
-            .min(self.pend.len());
-
-        let prev_title = std::mem::take(&mut self.pend_title);
-        let prev_proper = self.pend_proper;
-        let head = self.pend[..cut].to_vec();
-        let tail = self.pend[cut..].to_vec();
-        self.emit_silence_track(&prev_title, prev_proper, &head)?;
-
-        self.pend = tail;
-        self.seen += 1;
-        self.pend_title = title.to_string();
-        self.pend_proper = true;
-        Ok(())
-    }
-
-    /// Write a silence-cut track to `incomplete/` (with ID3), then move it unless
-    /// it is the partial first track or within the keep-incomplete count.
-    fn emit_silence_track(&mut self, title: &str, proper: bool, data: &[u8]) -> io::Result<()> {
-        let base = {
-            let b = sanitize(title);
-            if b.is_empty() {
-                format!("track_{:03}", self.seen.max(1))
-            } else {
-                b
-            }
-        };
-        let path = self.dedup_path(self.incomplete.join(fs_component(
-            format!("{base}.{}", self.ext),
-            self.codeset_filesys.as_deref(),
-        )));
-        let mut f = File::create(&path)?;
-        let mut bytes = 0u64;
-        if self.mp3like && !self.no_id3 && !self.without_id3v2 {
-            let (artist, song) = id3::split_artist_title(title);
-            let tag = id3::id3v2(artist, song, self.codeset_id3.as_deref());
-            f.write_all(&tag)?;
-            bytes += tag.len() as u64;
-        }
-        f.write_all(data)?;
-        bytes += data.len() as u64;
-        if self.mp3like && !self.no_id3 && self.with_id3v1 {
-            let (artist, song) = id3::split_artist_title(title);
-            f.write_all(&id3::id3v1(artist, song, self.codeset_id3.as_deref()))?;
-            bytes += 128;
-        }
-        drop(f);
-
-        if !proper {
-            return Ok(()); // partial first (or last in-progress): stays in incomplete
-        }
-        if self.kept < self.keep_incomplete {
-            self.kept += 1;
-            return Ok(());
-        }
-        self.move_completed(&path, title, bytes)
     }
 
     fn dest_basename(&self, title: &str, seqno: Option<u32>) -> String {
@@ -560,26 +657,53 @@ impl Recorder {
                         format!("{stem} ({n}).{ext}"),
                         self.codeset_filesys.as_deref(),
                     ));
-                    if !cand.exists() {
+                    if !cand.exists() && !self.is_show_file(&cand) {
                         return Ok(Some(cand));
                     }
                 }
-                Ok(Some(dest.to_path_buf()))
+                // never fall back to overwriting the original
+                Err(io::Error::other("no free versioned name"))
             }
         }
     }
 }
 
-/// Decode buffered mp3 bytes and write a .wav at `path`; returns the wav size.
-fn write_wav_file(path: &Path, raw: &[u8], ext: &str) -> io::Result<u64> {
-    let pcm = decode::decode_audio(raw, ext);
-    let mut f = File::create(path)?;
-    wav::write_wav(&mut f, &pcm.samples, pcm.channels, pcm.sample_rate)?;
-    Ok(pcm.samples.len() as u64 * 2)
+/// Decode an encoded `.part` file to the WAV at `dst`, removing the part on
+/// success. On failure the encoded file is kept (and reported). Returns the
+/// WAV file size.
+fn wav_from_part(src: &Path, dst: &Path, ext: &str) -> Option<u64> {
+    match decode::decode_to_wav(src, dst, ext) {
+        Ok(n) => {
+            let _ = fs::remove_file(src);
+            Some(n + 44)
+        }
+        Err(e) => {
+            eprintln!(
+                "  ! --wav: could not decode {} ({e}); kept the encoded file",
+                printable(&src.display().to_string())
+            );
+            let _ = fs::remove_file(dst);
+            None
+        }
+    }
 }
 
-/// Encode a filename component in the filesystem codeset (`--codeset-filesys`).
-/// Without a codeset (or off Unix) the UTF-8 name is used as-is.
+fn refuse_symlink(path: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(io::Error::other(format!(
+            "refusing to write through a symlink: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The single-file show is overwritten if it exists, but never via a symlink.
+fn create_show(path: &Path) -> io::Result<File> {
+    refuse_symlink(path)?;
+    File::create(path)
+}
+
 /// Does `name` already end with `.<ext>` (case-insensitive)? Used to avoid
 /// double-suffixing a single-file (`-a`) name that already carries its extension.
 fn ends_with_ext(name: &str, ext: &str) -> bool {
@@ -588,20 +712,53 @@ fn ends_with_ext(name: &str, ext: &str) -> bool {
         && name[name.len() - ext.len()..].eq_ignore_ascii_case(ext)
 }
 
-fn fs_component(name: String, codeset: Option<&str>) -> std::ffi::OsString {
+/// Build a `base.ext` filename component that fits NAME_MAX (with room for a
+/// de-dup suffix) after encoding in the filesystem codeset. Titles come from
+/// the stream and can be several KB; the base is cut on a char boundary.
+fn component(base: &str, ext: &str, codeset: Option<&str>) -> OsString {
+    let suffix = if ext.is_empty() {
+        String::new()
+    } else {
+        format!(".{ext}")
+    };
+    let budget = NAME_BUDGET.saturating_sub(suffix.len());
+    let mut b = truncate_utf8(base, budget).to_string();
+    let encoded_len = |s: &str| match codeset {
+        Some(cs) => crate::codeset::encode(s, Some(cs)).len(),
+        None => s.len(),
+    };
+    while encoded_len(&b) > budget {
+        b.pop();
+    }
+    let b = b.trim_end();
+    // Truncation + trimming can re-create "." / ".." (e.g. ".." + spaces + "x"):
+    // never return a name that resolves to a directory.
+    let b = if b.chars().all(|c| c == '.') { "_" } else { b };
+    fs_component(format!("{b}{suffix}"), codeset)
+}
+
+/// Encode a filename component in the filesystem codeset (`--codeset-filesys`).
+/// Without a codeset (or off Unix) the UTF-8 name is used as-is.
+fn fs_component(name: String, codeset: Option<&str>) -> OsString {
     match codeset {
         Some(cs) => {
             #[cfg(unix)]
             {
                 use std::os::unix::ffi::OsStrExt;
-                std::ffi::OsStr::from_bytes(&crate::codeset::encode(&name, Some(cs))).to_os_string()
+                let bytes = crate::codeset::encode(&name, Some(cs));
+                // Stateful encodings (ISO-2022-*) can emit '/' or NUL bytes;
+                // such a name would be a path, not a component: keep UTF-8.
+                if bytes.iter().any(|&b| b == b'/' || b == 0) {
+                    return OsString::from(name);
+                }
+                std::ffi::OsStr::from_bytes(&bytes).to_os_string()
             }
             #[cfg(not(unix))]
             {
-                std::ffi::OsString::from(name)
+                OsString::from(name)
             }
         }
-        None => std::ffi::OsString::from(name),
+        None => OsString::from(name),
     }
 }
 
@@ -645,7 +802,35 @@ fn apply_pattern(pattern: &str, title: &str, seqno: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ends_with_ext;
+    use super::*;
+
+    const MP3: &[u8] = include_bytes!("../testdata/sine.mp3");
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("crab_rec_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn cfg(dir: &Path) -> Config {
+        Config {
+            output_dir: Some(dir.to_string_lossy().into_owned()),
+            no_subdir: true,
+            ..Config::default()
+        }
+    }
+
+    fn files(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
 
     #[test]
     fn single_file_extension_rules() {
@@ -656,5 +841,113 @@ mod tests {
         assert!(ends_with_ext("show.MP3", "mp3")); // case-insensitive
         assert!(!ends_with_ext("show.aac", "mp3")); // wrong extension -> append
         assert!(!ends_with_ext("mp3", "mp3")); // no dot
+    }
+
+    #[test]
+    fn long_titles_fit_name_max() {
+        let title = "Zespół Pieśni i Tańca - ".to_string() + &"Żółć gęślą jaźń ".repeat(40);
+        let c = component(&sanitize(&title), "mp3", None);
+        assert!(c.len() <= NAME_BUDGET, "{} bytes", c.len());
+        assert!(c.to_string_lossy().ends_with(".mp3"));
+        let c = component(&title, "mp3", Some("cp1250"));
+        assert!(c.len() <= NAME_BUDGET);
+    }
+
+    /// Default (silence-split) mode: a re-sent identical title must not cut
+    /// the track, and the audio before the first title joins that track.
+    #[test]
+    fn repeated_title_does_not_split() {
+        let dir = tmpdir("repeat");
+        let mut r = Recorder::new(&cfg(&dir), "s", "mp3", 64, false).unwrap();
+        assert!(r.silence);
+        r.write_audio(&MP3[..4000]).unwrap(); // before any title
+        for chunk in MP3[4000..].chunks(2000) {
+            r.on_title("Band - Song").unwrap();
+            r.write_audio(chunk).unwrap();
+        }
+        r.finish().unwrap();
+        let inc = files(&dir.join("incomplete"));
+        assert_eq!(inc, vec!["Band - Song.mp3"], "{inc:?}");
+        let size = fs::metadata(dir.join("incomplete/Band - Song.mp3"))
+            .unwrap()
+            .len();
+        assert!(
+            size >= MP3.len() as u64,
+            "lost audio: {size} < {}",
+            MP3.len()
+        );
+        assert!(files(&dir).is_empty()); // first track is partial: not moved
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The silence cut moves audio between tracks but never loses or
+    /// duplicates any of it, and every byte is on disk without finish().
+    #[test]
+    fn silence_cut_conserves_audio() {
+        let dir = tmpdir("cut");
+        let mut r = Recorder::new(&cfg(&dir), "s", "mp3", 64, false).unwrap();
+        r.no_id3 = true;
+        let mut fed = 0;
+        for (i, chunk) in MP3.chunks(3000).enumerate() {
+            if i % 2 == 0 {
+                r.on_title(&format!("A - T{i}")).unwrap();
+            }
+            r.write_audio(chunk).unwrap();
+            fed += chunk.len();
+        }
+        // no finish(): data must already be on disk
+        let total: u64 = [dir.clone(), dir.join("incomplete")]
+            .iter()
+            .flat_map(|d| fs::read_dir(d).unwrap())
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        assert_eq!(total, fed as u64);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dotdot_stream_name_stays_inside_output_dir() {
+        let dir = tmpdir("dotdot");
+        let c = Config {
+            no_subdir: false,
+            ..cfg(&dir)
+        };
+        let r = Recorder::new(&c, "..", "mp3", 128, false).unwrap();
+        assert_eq!(r.root, dir.join("Crabripper_rips"));
+        // ".." padded so length-truncation + trimming leaves ".." again
+        for pad in [" ", "\u{3000}"] {
+            let name = format!("..{}x", pad.repeat(400));
+            let r = Recorder::new(&c, &name, "mp3", 128, false).unwrap();
+            assert!(r.root.starts_with(&dir) && r.root != dir, "{:?}", r.root);
+            assert!(r
+                .root
+                .components()
+                .all(|c| !matches!(c, std::path::Component::ParentDir)));
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A stream title equal to the show's name must not replace the show.
+    #[test]
+    fn track_never_replaces_show_file() {
+        let dir = tmpdir("show");
+        let c = Config {
+            single_file: true,
+            single_file_name: Some("Show".into()),
+            overwrite: Overwrite::Always,
+            ..cfg(&dir)
+        };
+        let mut r = Recorder::new(&c, "s", "mp3", 64, false).unwrap();
+        for t in ["A", "Show", "B"] {
+            r.on_title(t).unwrap();
+            r.write_audio(&MP3[..3000]).unwrap();
+        }
+        r.finish().unwrap();
+        let show = fs::metadata(dir.join("Show.mp3")).unwrap().len();
+        assert_eq!(show, 9000, "show file was replaced");
+        assert!(dir.join("Show (track).mp3").exists());
+        fs::remove_dir_all(&dir).ok();
     }
 }

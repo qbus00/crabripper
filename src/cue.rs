@@ -2,14 +2,26 @@
 
 use crate::id3::split_artist_title;
 
+/// A cue string field: titles come from the stream, so strip anything that
+/// could end the quoted value or the line (and thereby inject directives).
+fn field(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '"' => '\'',
+            c if (c as u32) < 0x20 || (0x7f..=0x9f).contains(&(c as u32)) => ' ',
+            c => c,
+        })
+        .collect()
+}
+
 /// Render a `.cue` sheet. `entries` is (title, start_seconds) in order.
 pub fn render(show_filename: &str, entries: &[(String, u64)]) -> String {
-    let mut s = format!("FILE \"{show_filename}\" MP3\n");
+    let mut s = format!("FILE \"{}\" MP3\n", field(show_filename));
     for (i, (title, sec)) in entries.iter().enumerate() {
         let (artist, song) = split_artist_title(title);
         s.push_str(&format!("  TRACK {:02} AUDIO\n", i + 1));
-        s.push_str(&format!("    TITLE \"{song}\"\n"));
-        s.push_str(&format!("    PERFORMER \"{artist}\"\n"));
+        s.push_str(&format!("    TITLE \"{}\"\n", field(song)));
+        s.push_str(&format!("    PERFORMER \"{}\"\n", field(artist)));
         // INDEX is MM:SS:FF (FF = frames, 75/sec); we align to whole seconds.
         s.push_str(&format!(
             "    INDEX 01 {:02}:{:02}:00\n",
@@ -33,5 +45,12 @@ mod tests {
         assert!(c.contains("TITLE \"B\""));
         assert!(c.contains("PERFORMER \"C\"")); // artist of track 2
         assert!(c.contains("INDEX 01 02:05:00"));
+    }
+
+    #[test]
+    fn title_cannot_inject_directives() {
+        let e = vec![("A - x\"\nFILE \"/etc/passwd\" MP3".to_string(), 0)];
+        let c = render("show.mp3", &e);
+        assert_eq!(c.lines().filter(|l| l.starts_with("FILE")).count(), 1);
     }
 }

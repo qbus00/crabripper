@@ -14,6 +14,14 @@ pub struct Url {
 
 pub fn parse(input: &str) -> Result<Url, String> {
     let input = input.trim();
+    // URLs also arrive from servers (redirect Location, HLS playlists) and are
+    // interpolated into the request line, so refuse anything that could break
+    // out of it (CR/LF and other controls). Literal spaces are percent-encoded.
+    if input.chars().any(|c| (c as u32) < 0x20 || c as u32 == 0x7f) {
+        return Err("URL contains control characters".to_string());
+    }
+    let encoded = input.replace(' ', "%20");
+    let input = encoded.as_str();
 
     let (scheme, rest) = match input.find("://") {
         Some(i) => (input[..i].to_lowercase(), &input[i + 3..]),
@@ -80,6 +88,12 @@ mod tests {
         assert!(u.tls);
         assert_eq!(u.port, 443);
         assert_eq!(u.path, "/");
+    }
+
+    #[test]
+    fn rejects_request_injection() {
+        assert!(parse("http://h/x\r\nHost: evil").is_err());
+        assert_eq!(parse("http://h/a b").unwrap().path, "/a%20b");
     }
 
     #[test]

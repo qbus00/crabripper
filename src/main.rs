@@ -1,4 +1,4 @@
-//! crabripper — a work-in-progress Rust port of streamripper.
+//! crabripper — a Rust port of streamripper.
 //!
 //! Records shoutcast/icecast streams (HTTP/HTTPS) to per-track files, reading
 //! ICY inline metadata to split on track boundaries. Aims for CLI/behaviour
@@ -10,6 +10,7 @@ mod conn;
 mod cue;
 mod decode;
 mod external;
+mod frames;
 mod hls;
 mod http;
 mod icy;
@@ -26,6 +27,7 @@ mod wav;
 
 use cli::{Config, Parsed};
 use std::time::{Duration, Instant};
+use util::printable;
 
 fn main() {
     let parsed = match cli::parse(std::env::args().collect::<Vec<_>>()) {
@@ -40,7 +42,7 @@ fn main() {
         Parsed::Exit(code) => std::process::exit(code),
     };
     if let Err(e) = run(&cfg) {
-        eprintln!("error: {e}");
+        eprintln!("error: {}", printable(&e));
         std::process::exit(1);
     }
 }
@@ -54,42 +56,57 @@ fn run(cfg: &Config) -> Result<(), String> {
 
     if cfg.debug {
         eprintln!(
-            "[debug] url={} ua={:?} timeout={}s reconnect={}",
-            cfg.url, cfg.user_agent, cfg.timeout, !cfg.no_reconnect
+            "[debug] url={} ua={:?} timeout={}s reconnect={} ssl_verify={}",
+            cfg.url, cfg.user_agent, cfg.timeout, !cfg.no_reconnect, cfg.ssl_verify
         );
     }
     if cfg.codeset_relay.is_some() {
-        // We relay the de-interleaved audio with no inline metadata, so there is
-        // nothing to transcode — accepted, but a no-op.
+        // The relay re-sends titles as UTF-8 text; nothing to transcode.
         say("note: --codeset-relay has no effect (the relay carries no metadata)");
     }
 
-    say(&format!("Connecting to {} ...", cfg.url));
-    let (conn, info, leftover) = http::open_stream(&cfg.url, cfg)?;
+    // The -l clock starts now (connecting counts), and arms the watchdog that
+    // cuts every socket once the run time is over.
+    let start = Instant::now();
+    let deadline = cfg
+        .length
+        .and_then(|l| start.checked_add(Duration::from_secs(l)));
+    if let Some(d) = deadline {
+        conn::set_deadline(d);
+    }
+
+    say(&format!("Connecting to {} ...", printable(&cfg.url)));
+    let (body, info) = http::open_stream(&cfg.url, cfg).map_err(|e| {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            "run time limit (-l) reached before the stream started".to_string()
+        } else {
+            e
+        }
+    })?;
     if info.final_url != cfg.url {
-        say(&format!("  -> {}", info.final_url));
+        say(&format!("  -> {}", printable(&info.final_url)));
     }
 
     if info.is_hls {
         say("HLS (.m3u8) stream detected");
-        drop(conn); // the HLS ripper re-fetches the playlist as a whole body
-        return hls::rip(&info.final_url, cfg);
+        drop(body); // the HLS ripper re-fetches the playlist as a whole body
+        return hls::rip(&info.final_url, cfg, deadline);
     }
 
     say(&format!(
         "stream: {}",
         if info.name.is_empty() {
-            "(unnamed)"
+            "(unnamed)".to_string()
         } else {
-            &info.name
+            printable(&info.name)
         }
     ));
     say(&format!(
         "content-type: {} -> .{}",
         if info.content_type.is_empty() {
-            "(none)"
+            "(none)".to_string()
         } else {
-            &info.content_type
+            printable(&info.content_type)
         },
         info.ext
     ));
@@ -132,9 +149,10 @@ fn run(cfg: &Config) -> Result<(), String> {
 
     // FLAC/Ogg specifics: native FLAC -> .flac; FLAC carried in Ogg -> .oga
     // (detected by sniffing the first bytes). FLAC is captured whole (never split).
+    let mut src = source::Source::new(body);
     let mut ext = info.ext.clone();
     let mut no_split = ext == "flac";
-    if ext == "ogg" && leftover_has_flac(&leftover) {
+    if ext == "ogg" && has_flac(src.peek(64).unwrap_or_default()) {
         ext = "oga".to_string();
         no_split = true;
         say("Ogg stream carries FLAC -> .oga (captured whole)");
@@ -144,18 +162,18 @@ fn run(cfg: &Config) -> Result<(), String> {
         recorder::Recorder::new(cfg, &info.name, &ext, info.bitrate.unwrap_or(128), no_split)
             .map_err(|e| e.to_string())?;
 
-    // -E external metadata source (overrides ICY metadata when present).
-    let ext_rx = match &cfg.external_cmd {
+    // -E external metadata source (overrides ICY metadata when present). Held
+    // for the whole run; dropping it kills the command.
+    let external = match &cfg.external_cmd {
         Some(cmd) => {
             say(&format!("external metadata: {cmd}"));
             Some(external::spawn(cmd).map_err(|e| format!("-E: {e}"))?)
         }
         None => None,
     };
+    let ext_rx = external.as_ref().map(|x| &x.rx);
 
-    let start = Instant::now();
-    let deadline = cfg.length.map(|l| start + Duration::from_secs(l));
-    let max_bytes = cfg.max_megabytes.map(|m| m * 1024 * 1024);
+    let max_bytes = cfg.max_megabytes.map(|m| m.saturating_mul(1024 * 1024));
     let expired = |total: u64| {
         deadline.is_some_and(|d| Instant::now() >= d) || max_bytes.is_some_and(|mb| total >= mb)
     };
@@ -163,9 +181,9 @@ fn run(cfg: &Config) -> Result<(), String> {
     let mut total: u64 = 0;
     // The first connection is already open; on a drop, reconnect and continue the
     // same recording — unless -c (no_reconnect) or the time/size limit is reached.
-    let mut next = Some((conn, leftover));
+    let mut next = Some((src, info.metaint));
     loop {
-        let (conn, leftover) = match next.take() {
+        let (mut src, metaint) = match next.take() {
             Some(cl) => cl,
             None => {
                 if cfg.no_reconnect || expired(total) {
@@ -174,25 +192,17 @@ fn run(cfg: &Config) -> Result<(), String> {
                 say("stream dropped — reconnecting in 2s ...");
                 std::thread::sleep(Duration::from_secs(2));
                 match http::open_stream(&cfg.url, cfg) {
-                    Ok((c, _, l)) => (c, l),
+                    // The new connection may use a different metadata interval.
+                    Ok((b, i)) => (source::Source::new(b), i.metaint),
                     Err(e) => {
-                        eprintln!("  ! reconnect failed: {e}");
+                        eprintln!("  ! reconnect failed: {}", printable(&e));
                         continue;
                     }
                 }
             }
         };
-        let mut src = source::Source::new(conn, leftover);
         match rip_stream(
-            cfg,
-            &info,
-            &ext,
-            &mut rec,
-            &relay,
-            &mut total,
-            &expired,
-            &mut src,
-            ext_rx.as_ref(),
+            cfg, metaint, &ext, &mut rec, &relay, &mut total, &expired, &mut src, ext_rx,
         )? {
             StopReason::Done => break,
             StopReason::Disconnected => {
@@ -204,6 +214,7 @@ fn run(cfg: &Config) -> Result<(), String> {
     }
 
     rec.finish().map_err(|e| e.to_string())?;
+    drop(external);
     say(&format!(
         "done ({:.0}s, {} KB).",
         start.elapsed().as_secs_f64(),
@@ -214,14 +225,16 @@ fn run(cfg: &Config) -> Result<(), String> {
 
 enum StopReason {
     Done,         // -l / -M reached — stop for good
-    Disconnected, // stream ended or dropped — reconnect unless -c
+    Disconnected, // stream ended, dropped or errored — reconnect unless -c
 }
 
-/// One connection's worth of ripping. Returns why it stopped.
+/// One connection's worth of ripping. Returns why it stopped. Network errors
+/// end the connection (and trigger a reconnect); only local errors (disk) are
+/// fatal.
 #[allow(clippy::too_many_arguments)]
 fn rip_stream(
     cfg: &Config,
-    info: &http::StreamInfo,
+    metaint: usize,
     ext: &str,
     rec: &mut recorder::Recorder,
     relay: &Option<relay::Relay>,
@@ -235,6 +248,18 @@ fn rip_stream(
             eprintln!("{m}");
         }
     };
+    // A read failure (reset, timeout, TLS close) is a disconnect, not the end —
+    // unless the run time is up (the watchdog closes sockets at the deadline).
+    let lost = |e: std::io::Error, total: u64| {
+        if expired(total) {
+            return StopReason::Done;
+        }
+        say(&format!(
+            "  ! connection error: {}",
+            printable(&e.to_string())
+        ));
+        StopReason::Disconnected
+    };
     let mut audio = Vec::new();
 
     if ext == "ogg" {
@@ -244,8 +269,10 @@ fn rip_stream(
             if expired(*total) {
                 return Ok(StopReason::Done);
             }
-            if !src.read_some(&mut audio).map_err(|e| e.to_string())? {
-                return Ok(StopReason::Disconnected);
+            match src.read_some(&mut audio) {
+                Ok(true) => {}
+                Ok(false) => return Ok(StopReason::Disconnected),
+                Err(e) => return Ok(lost(e, *total)),
             }
             *total += audio.len() as u64;
             for ev in splitter.push(&audio) {
@@ -261,35 +288,38 @@ fn rip_stream(
                 }
             }
         }
-    } else if info.metaint > 0 {
+    } else if metaint > 0 {
         let mut meta = Vec::new();
         loop {
             if expired(*total) {
                 return Ok(StopReason::Done);
             }
-            if !src
-                .read_exact_n(info.metaint, &mut audio)
-                .map_err(|e| e.to_string())?
-            {
-                return Ok(StopReason::Disconnected);
+            let full = src.read_exact_n(metaint, &mut audio);
+            // Keep whatever audio arrived, even if the connection then dropped.
+            if !audio.is_empty() {
+                *total += audio.len() as u64;
+                rec.write_audio(&audio).map_err(|e| e.to_string())?;
+                if let Some(r) = relay {
+                    r.broadcast(&audio);
+                }
             }
-            *total += audio.len() as u64;
-            rec.write_audio(&audio).map_err(|e| e.to_string())?;
-            if let Some(r) = relay {
-                r.broadcast(&audio);
+            match full {
+                Ok(true) => {}
+                Ok(false) => return Ok(StopReason::Disconnected),
+                Err(e) => return Ok(lost(e, *total)),
             }
             drain_external(ext_meta, cfg, rec, relay)?;
-            let len_byte = match src.read_byte().map_err(|e| e.to_string())? {
-                Some(b) => b,
-                None => return Ok(StopReason::Disconnected),
+            let len_byte = match src.read_byte() {
+                Ok(Some(b)) => b,
+                Ok(None) => return Ok(StopReason::Disconnected),
+                Err(e) => return Ok(lost(e, *total)),
             };
             let meta_len = len_byte as usize * 16;
             if meta_len > 0 {
-                if !src
-                    .read_exact_n(meta_len, &mut meta)
-                    .map_err(|e| e.to_string())?
-                {
-                    return Ok(StopReason::Disconnected);
+                match src.read_exact_n(meta_len, &mut meta) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(StopReason::Disconnected),
+                    Err(e) => return Ok(lost(e, *total)),
                 }
                 // ICY metadata — skipped when an external source (-E) is driving.
                 if ext_meta.is_none() {
@@ -312,8 +342,10 @@ fn rip_stream(
             if expired(*total) {
                 return Ok(StopReason::Done);
             }
-            if !src.read_some(&mut audio).map_err(|e| e.to_string())? {
-                return Ok(StopReason::Disconnected);
+            match src.read_some(&mut audio) {
+                Ok(true) => {}
+                Ok(false) => return Ok(StopReason::Disconnected),
+                Err(e) => return Ok(lost(e, *total)),
             }
             *total += audio.len() as u64;
             rec.write_audio(&audio).map_err(|e| e.to_string())?;
@@ -347,7 +379,6 @@ fn drain_external(
 }
 
 /// Sniff the first bytes of an Ogg body for the FLAC signature (FLAC-in-Ogg).
-fn leftover_has_flac(b: &[u8]) -> bool {
-    let n = b.len().min(64);
-    b[..n].windows(4).any(|w| w == b"FLAC")
+fn has_flac(b: &[u8]) -> bool {
+    b.windows(4).any(|w| w == b"FLAC")
 }

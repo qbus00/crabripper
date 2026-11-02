@@ -59,6 +59,7 @@ pub struct Recorder {
     no_individual: bool,
     overwrite: Overwrite,
     pattern: Option<String>,
+    track_suffix: String, // `_2`... when several streams share one command
     seq: Option<u32>,
     keep_incomplete: u32,
 
@@ -135,7 +136,7 @@ impl Recorder {
         // --wav decodes to 16-bit PCM WAV (symphonia: mp3/aac/ogg-vorbis/flac).
         let wav = cfg.wav && matches!(ext, "mp3" | "aac" | "ogg" | "oga" | "flac");
         if cfg.wav && !wav {
-            eprintln!("  ! --wav: cannot decode this stream type; recording as-is");
+            crate::elog!("  ! --wav: cannot decode this stream type; recording as-is");
         }
 
         // Silence-based splitpoint (mp3/aac — frame-contiguous), on by default.
@@ -161,15 +162,18 @@ impl Recorder {
                 // exactly that extension (so `-a show.aac` on an AAC stream stays
                 // `show.aac`, but `-a Krakow.2026-10-24` becomes `...mp3`). Matching
                 // on any `.` would wrongly treat a dotted date as an extension.
-                Some(n) if ends_with_ext(n, ext) => n.clone(),
-                Some(n) => format!("{n}.{ext}"),
-                None => format!("sr_{}.{ext}", now_stamp()),
+                // A multi-stream suffix (`_2`) goes before the extension.
+                Some(n) if ends_with_ext(n, ext) => {
+                    format!("{}{}.{ext}", &n[..n.len() - ext.len() - 1], cfg.name_suffix)
+                }
+                Some(n) => format!("{n}{}.{ext}", cfg.name_suffix),
+                None => format!("sr_{}{}.{ext}", now_stamp(), cfg.name_suffix),
             };
             let path = root.join(fs_component(
                 sanitize(&name),
                 cfg.codeset_filesys.as_deref(),
             ));
-            eprintln!("[show file] {}", printable(&path.display().to_string()));
+            crate::elog!("[show file] {}", printable(&path.display().to_string()));
             (Some(create_show(&path)?), Some(path))
         } else {
             (None, None)
@@ -185,6 +189,7 @@ impl Recorder {
             no_individual: cfg.no_individual,
             overwrite: cfg.overwrite,
             pattern: cfg.pattern.clone(),
+            track_suffix: cfg.track_suffix.clone(),
             seq: cfg.seq,
             keep_incomplete: cfg.keep_incomplete.unwrap_or(0),
             no_id3: cfg.no_id3,
@@ -304,13 +309,13 @@ impl Recorder {
         // A track file that cannot be created (odd filesystem limits, a stale
         // file) costs that track's file, never the whole recording.
         let made = self.new_track_file(title, &base).or_else(|e| {
-            eprintln!("  ! cannot create track file ({e}); using {fallback}");
+            crate::elog!("  ! cannot create track file ({e}); using {fallback}");
             self.new_track_file(title, &fallback)
         });
         let (path, file, src, bytes) = match made {
             Ok((path, f, src, bytes)) => (path, Some(f), src, bytes),
             Err(e) => {
-                eprintln!("  ! cannot create track file ({e}); this track is not saved");
+                crate::elog!("  ! cannot create track file ({e}); this track is not saved");
                 (PathBuf::new(), None, None, 0)
             }
         };
@@ -558,7 +563,7 @@ impl Recorder {
         match outcome {
             Ok(Some(final_dest)) => {
                 self.completed += 1;
-                eprintln!(
+                crate::elog!(
                     "[track {:>3}] {}",
                     self.completed,
                     printable(&final_dest.display().to_string())
@@ -567,7 +572,7 @@ impl Recorder {
             Ok(None) => {
                 let _ = fs::remove_file(from);
             }
-            Err(e) => eprintln!(
+            Err(e) => crate::elog!(
                 "  ! could not complete {} ({e}); left in incomplete/",
                 printable(&from.display().to_string())
             ),
@@ -596,7 +601,7 @@ impl Recorder {
             let cue_path = show_path.with_extension("cue");
             fs::write(&cue_path, cue::render(&show_name, &self.cue_entries))?;
             if announce {
-                eprintln!("[cue] {}", printable(&cue_path.display().to_string()));
+                crate::elog!("[cue] {}", printable(&cue_path.display().to_string()));
             }
         }
         Ok(())
@@ -670,6 +675,7 @@ impl Recorder {
                 base = format!("{n:04}_{base}");
             }
         }
+        base.push_str(&self.track_suffix);
         base
     }
 
@@ -720,7 +726,7 @@ fn wav_from_part(src: &Path, dst: &Path, ext: &str) -> Option<u64> {
             Some(n + 44)
         }
         Err(e) => {
-            eprintln!(
+            crate::elog!(
                 "  ! --wav: could not decode {} ({e}); kept the encoded file",
                 printable(&src.display().to_string())
             );

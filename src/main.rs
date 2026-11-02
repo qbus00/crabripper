@@ -41,21 +41,67 @@ fn main() {
         Parsed::Run(c) => c,
         Parsed::Exit(code) => std::process::exit(code),
     };
-    if let Err(e) = run(&cfg) {
-        eprintln!("error: {}", printable(&e));
+
+    // The -l clock starts now (connecting counts), and arms the watchdog that
+    // cuts every socket once the run time is over — shared by all streams.
+    let start = Instant::now();
+    let deadline = cfg
+        .length
+        .and_then(|l| start.checked_add(Duration::from_secs(l)));
+    if let Some(d) = deadline {
+        conn::set_deadline(d);
+    }
+
+    let streams = cfg.streams();
+    if let [one] = streams.as_slice() {
+        if let Err(e) = run(one, start, deadline) {
+            eprintln!("error: {}", printable(&e));
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // Several URLs: record them all at once, one thread each, every console
+    // line tagged with the stream's number. Exit 1 if any of them failed.
+    if !cfg.quiet {
+        eprintln!("Recording {} streams in parallel", streams.len());
+    }
+    let failed = std::thread::scope(|sc| {
+        let handles: Vec<_> = streams
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                sc.spawn(move || {
+                    util::set_log_tag(format!("[{}] ", i + 1));
+                    let r = run(c, start, deadline);
+                    if let Err(e) = &r {
+                        elog!("error: {}", printable(e));
+                    }
+                    r.is_err()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(true))
+            .filter(|&f| f)
+            .count()
+    });
+    if failed > 0 {
+        eprintln!("error: {failed} of {} streams failed", streams.len());
         std::process::exit(1);
     }
 }
 
-fn run(cfg: &Config) -> Result<(), String> {
+fn run(cfg: &Config, start: Instant, deadline: Option<Instant>) -> Result<(), String> {
     let say = |m: &str| {
         if !cfg.quiet {
-            eprintln!("{m}");
+            elog!("{m}");
         }
     };
 
     if cfg.debug {
-        eprintln!(
+        elog!(
             "[debug] url={} ua={:?} timeout={}s reconnect={} ssl_verify={}",
             cfg.url, cfg.user_agent, cfg.timeout, !cfg.no_reconnect, cfg.ssl_verify
         );
@@ -65,24 +111,40 @@ fn run(cfg: &Config) -> Result<(), String> {
         say("note: --codeset-relay has no effect (the relay carries no metadata)");
     }
 
-    // The -l clock starts now (connecting counts), and arms the watchdog that
-    // cuts every socket once the run time is over.
-    let start = Instant::now();
-    let deadline = cfg
-        .length
-        .and_then(|l| start.checked_add(Duration::from_secs(l)));
-    if let Some(d) = deadline {
-        conn::set_deadline(d);
-    }
-
     say(&format!("Connecting to {} ...", printable(&cfg.url)));
-    let (body, info) = http::open_stream(&cfg.url, cfg).map_err(|e| {
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            "run time limit (-l) reached before the stream started".to_string()
-        } else {
-            e
+    // A malformed URL can never work: fail at once rather than retrying it.
+    url::parse(&cfg.url)?;
+    // With a run time (-l), a stream that is down at the start is retried
+    // until it comes up or the time is over — a scheduled recording should
+    // catch the rest of the show, not give up. Without -l (or with -c) the
+    // first failure is final, as in streamripper.
+    let mut wait = Duration::from_secs(2);
+    let mut last_err: Option<String> = None; // the real cause, for the final message
+    let (body, info) = loop {
+        match http::open_stream(&cfg.url, cfg) {
+            Ok(opened) => break opened,
+            Err(e) => {
+                let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+                if left.is_some_and(|l| l.is_zero()) {
+                    return Err(format!(
+                        "run time limit (-l) reached before the stream started (last error: {})",
+                        last_err.unwrap_or(e)
+                    ));
+                }
+                let Some(left) = left.filter(|_| !cfg.no_reconnect) else {
+                    return Err(e);
+                };
+                elog!(
+                    "  ! cannot start: {}; retrying in {}s ...",
+                    printable(&e),
+                    wait.as_secs()
+                );
+                last_err = Some(e);
+                std::thread::sleep(wait.min(left));
+                wait = (wait * 2).min(Duration::from_secs(30));
+            }
         }
-    })?;
+    };
     if info.final_url != cfg.url {
         say(&format!("  -> {}", printable(&info.final_url)));
     }
@@ -139,7 +201,7 @@ fn run(cfg: &Config) -> Result<(), String> {
                 Some(r)
             }
             Err(e) => {
-                eprintln!("  ! relay disabled: {e}");
+                elog!("  ! relay disabled: {e}");
                 None
             }
         }
@@ -195,7 +257,7 @@ fn run(cfg: &Config) -> Result<(), String> {
                     // The new connection may use a different metadata interval.
                     Ok((b, i)) => (source::Source::new(b), i.metaint),
                     Err(e) => {
-                        eprintln!("  ! reconnect failed: {}", printable(&e));
+                        elog!("  ! reconnect failed: {}", printable(&e));
                         continue;
                     }
                 }
@@ -245,7 +307,7 @@ fn rip_stream(
 ) -> Result<StopReason, String> {
     let say = |m: &str| {
         if !cfg.quiet {
-            eprintln!("{m}");
+            elog!("{m}");
         }
     };
     // A read failure (reset, timeout, TLS close) is a disconnect, not the end —

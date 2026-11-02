@@ -34,7 +34,7 @@ const MAX_POLL: u64 = 30;
 pub fn rip(url: &str, cfg: &Config, deadline: Option<Instant>) -> Result<(), String> {
     let say = |m: &str| {
         if !cfg.quiet {
-            eprintln!("{m}");
+            crate::elog!("{m}");
         }
     };
     let start = Instant::now();

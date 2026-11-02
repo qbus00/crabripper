@@ -37,6 +37,7 @@ The C streamripper works well, but the Rust port gains:
 | Ogg per-track splitting (on Ogg logical-stream boundaries) | ✅ |
 | HLS AES-128 decryption (`#EXT-X-KEY`) | ✅ |
 | Auto-reconnect on stream drop (`-c` to disable) | ✅ |
+| With `-l`: retry a stream that is down at start, until it's up or time is over | ✅ (crabripper) |
 | Metadata rulefiles (`-w`), external metadata (`-E`), interface bind (`-I`) | ✅ |
 | Charset conversion (`--codeset-metadata`/`-id3`/`-filesys`), `--debug`, `--stderr` | ✅ |
 | TLS cert check against Mozilla roots (default on; `--no-ssl-verify` to skip) | ✅ |
@@ -133,7 +134,7 @@ everything crabripper reads, so it is built to fail safe:
 ## Usage
 
 ```sh
-crabripper URL [options]
+crabripper URL [URL...] [options]
 ```
 
 Common options (run `-h` for the full streamripper-compatible list):
@@ -142,7 +143,7 @@ Common options (run `-h` for the full streamripper-compatible list):
 |---|---|
 | `-d dir` | output directory |
 | `-s` | no per-stream subdirectory |
-| `-a [file]` | single-file recording (+ cue) |
+| `-a [file]` | single-file recording (+ cue); repeat to name each URL |
 | `-A` | don't write individual tracks |
 | `-l len` | run time: `3600`, `90s`/`12m`/`2h`, or `1:30:00` |
 | `-r [[ip:]port]` | relay server (default port 8000) |
@@ -156,6 +157,29 @@ Common options (run `-h` for the full streamripper-compatible list):
 crabripper http://stream4.nadaje.com:9680/radiokrakow-s3 -d ~/rec -l 1h
 crabripper https://ice1.somafm.com/indiepop-128-mp3 -r 8000 -u "WinampMPEG/5.0"
 crabripper "https://example.com/live/playlist.m3u8" -a show.aac -l 2h
+```
+
+### Several streams in one command
+
+Give more than one URL and crabripper records them all at the same time in one
+process (e.g. a station's main and backup stream), so one scheduled job replaces
+several near-identical ones. All options (`-l`, `-d`, `-o`, ...) apply to every
+stream; console lines are tagged `[1]`, `[2]`, ...
+
+- `-a` names pair with URLs in order. A URL without its own `-a` name reuses the
+  first name with `_2`, `_3`, ... added (before the extension), or the
+  timestamped default when no name was given.
+- Individual track files of the 2nd, 3rd, ... stream get the same `_N` suffix,
+  so same-titled tracks from mirrored streams never overwrite each other.
+- Each stream (re)connects on its own; one failing doesn't stop the others. The
+  exit code is non-zero if any stream failed.
+- `-r` (relay) needs a single URL.
+
+```sh
+crabripper http://stream4.nadaje.com:9680/radiokrakow-s3 \
+           http://stream3.nadaje.com:9120/radiokrakow \
+           -a Krakow.$D -a Krakow_backup.$D -d ~/rec -l 2h -s -A
+# -> Krakow.<D>.mp3 and Krakow_backup.<D>.mp3
 ```
 
 ## Credits & license

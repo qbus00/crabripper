@@ -40,7 +40,18 @@ pub enum Xs {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// The stream this config records (one per thread; see `streams`).
     pub url: String,
+    /// Every URL given on the command line, in order (crabripper extension:
+    /// several URLs record in parallel from one command).
+    pub urls: Vec<String>,
+    /// Every `-a NAME` given, in order; paired with `urls` by position.
+    pub names: Vec<String>,
+    /// Added to this stream's auto-filled single-file name (`_2`, `_3`, ...).
+    pub name_suffix: String,
+    /// Added to this stream's individual track filenames when several
+    /// streams share one command, so same-titled tracks never collide.
+    pub track_suffix: String,
 
     // output / layout
     pub output_dir: Option<String>, // -d
@@ -120,6 +131,10 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             url: String::new(),
+            urls: Vec::new(),
+            names: Vec::new(),
+            name_suffix: String::new(),
+            track_suffix: String::new(),
             output_dir: None,
             pattern: None,
             no_subdir: false,
@@ -175,6 +190,37 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// One config per stream URL. Each `-a` name pairs with its URL by
+    /// position; a URL without its own name reuses the first name (or the
+    /// timestamped default) with `_2`, `_3`, ... added, so nothing collides.
+    pub fn streams(&self) -> Vec<Config> {
+        let multi = self.urls.len() > 1;
+        self.urls
+            .iter()
+            .enumerate()
+            .map(|(i, url)| {
+                let mut c = self.clone();
+                c.url = url.clone();
+                let n = i + 1;
+                match self.names.get(i) {
+                    Some(name) => c.single_file_name = Some(name.clone()),
+                    None => {
+                        c.single_file_name = self.names.first().cloned();
+                        if n > 1 {
+                            c.name_suffix = format!("_{n}");
+                        }
+                    }
+                }
+                if multi && n > 1 {
+                    c.track_suffix = format!("_{n}");
+                }
+                c
+            })
+            .collect()
+    }
+}
+
 /// Outcome of parsing: run with a config, or exit early (help/version).
 pub enum Parsed {
     Run(Box<Config>),
@@ -214,7 +260,6 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     }
 
     let mut i = 0;
-    let mut url_set = false;
     while i < argv.len() {
         let a = argv[i].clone();
         // helper to fetch the next token as this option's value
@@ -236,10 +281,11 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             }
             "-a" => {
                 c.single_file = true;
-                // -a optionally takes a filename (only if the next arg isn't an option)
+                // -a optionally takes a filename (only if the next arg isn't an
+                // option or a URL). Repeat -a to name several streams in order.
                 if let Some(n) = argv.get(i + 1) {
-                    if !n.starts_with('-') {
-                        c.single_file_name = Some(n.clone());
+                    if !n.starts_with('-') && !n.contains("://") {
+                        c.names.push(n.clone());
                         i += 1;
                     }
                 }
@@ -338,20 +384,29 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
                     c.config = Some(v.to_string());
                 } else if a.starts_with('-') && a != "-" {
                     return Err(format!("unknown option: {a}"));
-                } else if !url_set {
-                    c.url = a;
-                    url_set = true;
                 } else {
-                    return Err(format!("unexpected argument: {a}"));
+                    c.urls.push(a);
                 }
             }
         }
         i += 1;
     }
 
-    if c.url.is_empty() {
+    if c.urls.is_empty() {
         return Err("no stream URL given (try -h)".to_string());
     }
+    if c.names.len() > c.urls.len() {
+        return Err(format!(
+            "{} -a names given for {} stream URL(s)",
+            c.names.len(),
+            c.urls.len()
+        ));
+    }
+    if c.urls.len() > 1 && c.relay_port.is_some() {
+        return Err("-r (relay) works with a single stream URL only".to_string());
+    }
+    c.url = c.urls[0].clone();
+    c.single_file_name = c.names.first().cloned();
     if let Some(rf) = c.rulefile.clone() {
         c.rules = Rules::load(&rf)?;
     }
@@ -452,10 +507,12 @@ pub fn parse_length(s: &str) -> Result<u64, String> {
 
 pub fn print_usage() {
     let u = "\
-Usage: crabripper URL [OPTIONS]   (Rust port; aims for streamripper CLI parity)
+Usage: crabripper URL [URL...] [OPTIONS]   (Rust port; aims for streamripper CLI parity)
 Opts: -h             - Print this listing
       -v             - Print version info and quit
-      -a [file]      - Rip to single file, default name is timestamped
+      -a [file]      - Rip to single file, default name is timestamped.
+                       Repeat -a to name each URL in order; URLs left without
+                       a name reuse the first one with _2, _3, ... added
       -A             - Don't write individual tracks
       -d dir         - The destination directory
       -D pattern     - Write files using specified pattern
@@ -469,7 +526,9 @@ Opts: -h             - Print this listing
       -t             - Don't overwrite tracks in incomplete
       -c             - Don't auto-reconnect
       -l length      - How long to run: seconds (3600), unit (90s/12m/2h),
-                       or hh:mm[:ss] (1:30 or 1:30:00); else runs forever
+                       or hh:mm[:ss] (1:30 or 1:30:00); else runs forever.
+                       With -l, a stream that is down at the start is
+                       retried until it comes up or the time is over
       -M megabytes   - Stop ripping after this many megabytes
       -q [start]     - Add sequence number to output file
       -u useragent   - Use a different UserAgent than \"crabripper\"
@@ -503,7 +562,9 @@ crabripper extensions:
       --log            - Write a timestamped played.log of track titles
       --split-time=SECS - Force a new track every N seconds (or 90s/12m/2h)
       --split-size=MB  - Force a new track every N megabytes
-      -C file / --config=file - Read options from a file (CLI overrides it)";
+      -C file / --config=file - Read options from a file (CLI overrides it)
+      Several URLs record in parallel in one process, each to its own files,
+      sharing every option (-l, -d, ...); console lines are tagged [1], [2]...";
     eprintln!("{u}");
 }
 
@@ -586,6 +647,56 @@ mod tests {
     fn tls_verified_by_default() {
         assert!(cfg(&["url"]).ssl_verify);
         assert!(!cfg(&["url", "--no-ssl-verify"]).ssl_verify);
+    }
+
+    #[test]
+    fn multi_url_names_pair_in_order() {
+        let c = cfg(&["u1", "u2", "-a", "Krakow.d", "-a", "Krakow_backup.d", "-A"]);
+        let s = c.streams();
+        assert_eq!(s.len(), 2);
+        assert_eq!((s[0].url.as_str(), s[1].url.as_str()), ("u1", "u2"));
+        assert_eq!(s[0].single_file_name.as_deref(), Some("Krakow.d"));
+        assert_eq!(s[1].single_file_name.as_deref(), Some("Krakow_backup.d"));
+        assert_eq!((s[0].name_suffix.as_str(), s[1].name_suffix.as_str()), ("", ""));
+        assert_eq!((s[0].track_suffix.as_str(), s[1].track_suffix.as_str()), ("", "_2"));
+    }
+
+    #[test]
+    fn multi_url_missing_names_get_suffixes() {
+        let s = cfg(&["u1", "-a", "show", "u2", "u3"]).streams();
+        assert_eq!(s.len(), 3);
+        assert!(s.iter().all(|c| c.single_file_name.as_deref() == Some("show")));
+        let suf: Vec<_> = s.iter().map(|c| c.name_suffix.as_str()).collect();
+        assert_eq!(suf, ["", "_2", "_3"]);
+        // -a with no name at all: timestamped defaults, still suffixed
+        let s = cfg(&["u1", "u2", "-a", "-A"]).streams();
+        assert!(s[0].single_file_name.is_none() && s[1].name_suffix == "_2");
+    }
+
+    #[test]
+    fn multi_url_errors() {
+        let p = |a: &[&str]| {
+            let mut v = vec!["crabripper".to_string()];
+            v.extend(a.iter().map(|s| s.to_string()));
+            parse(v)
+        };
+        assert!(p(&["u1", "-a", "x", "-a", "y"]).is_err());
+        assert!(p(&["u1", "u2", "-r"]).is_err());
+    }
+
+    #[test]
+    fn a_does_not_swallow_a_url() {
+        let c = cfg(&["-a", "http://x/1", "http://x/2"]);
+        assert!(c.single_file && c.names.is_empty());
+        assert_eq!(c.urls, ["http://x/1", "http://x/2"]);
+    }
+
+    #[test]
+    fn single_url_unchanged() {
+        let s = cfg(&["http://x/y", "-a", "show"]).streams();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].single_file_name.as_deref(), Some("show"));
+        assert!(s[0].name_suffix.is_empty() && s[0].track_suffix.is_empty());
     }
 
     #[test]

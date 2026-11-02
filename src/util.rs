@@ -1,6 +1,29 @@
 //! Small shared, dependency-free helpers.
 
+use std::cell::RefCell;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+thread_local! {
+    /// Per-thread console prefix (`[1] `, `[2] `...) when several streams
+    /// record at once; empty for a single stream.
+    static LOG_TAG: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Set this thread's console prefix (see `elog!`).
+pub fn set_log_tag(tag: String) {
+    LOG_TAG.with(|t| *t.borrow_mut() = tag);
+}
+
+/// Print one status line to stderr, prefixed with this thread's tag.
+pub fn elog_line(args: std::fmt::Arguments) {
+    LOG_TAG.with(|t| eprintln!("{}{}", t.borrow(), args));
+}
+
+/// `eprintln!` that prefixes the line with the current stream's tag.
+#[macro_export]
+macro_rules! elog {
+    ($($t:tt)*) => { $crate::util::elog_line(format_args!($($t)*)) };
+}
 
 /// Is `c` a control character (C0, DEL or C1)? These must never reach a
 /// filename, a terminal, or a header line verbatim.

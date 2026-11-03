@@ -7,13 +7,13 @@
 //! rather than ending a scheduled recording.
 
 use crate::cli::{Config, HlsVariant};
+use crate::conn;
 use crate::http::{self, Limits};
 use crate::util::{now_stamp, printable, sanitize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
-use std::thread;
 use std::time::{Duration, Instant};
 
 const PLAYLIST: Limits = Limits {
@@ -80,14 +80,14 @@ pub fn rip(url: &str, cfg: &Config, deadline: Option<Instant>) -> Result<(), Str
     }
     let mut file = File::create(&path).map_err(|e| e.to_string())?;
 
-    let expired = || deadline.is_some_and(|d| Instant::now() >= d);
+    let expired = || deadline.is_some_and(|d| Instant::now() >= d) || conn::stop_requested();
     // Sleep `secs`, but never past the deadline.
     let nap = |secs: u64| {
         let mut d = Duration::from_secs(secs.clamp(1, MAX_POLL));
         if let Some(dl) = deadline {
             d = d.min(dl.saturating_duration_since(Instant::now()));
         }
-        thread::sleep(d);
+        conn::sleep(d);
     };
 
     let mut seen: HashSet<String> = HashSet::new();
@@ -307,7 +307,7 @@ fn fetch_retry(url: &str, cfg: &Config, limits: Limits) -> Result<Vec<u8>, Strin
     match http::fetch(url, cfg, limits) {
         Ok(f) => Ok(f.body),
         Err(_) => {
-            thread::sleep(Duration::from_secs(1));
+            conn::sleep(Duration::from_secs(1));
             http::fetch(url, cfg, limits).map(|f| f.body)
         }
     }

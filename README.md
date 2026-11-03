@@ -37,6 +37,7 @@ The C streamripper works well, but the Rust port gains:
 | Ogg per-track splitting (on Ogg logical-stream boundaries) | ✅ |
 | HLS AES-128 decryption (`#EXT-X-KEY`) | ✅ |
 | Auto-reconnect on stream drop (`-c` to disable) | ✅ |
+| Graceful stop on SIGINT/SIGTERM/SIGHUP (files finished as at `-l`) | ✅ (crabripper) |
 | With `-l`: retry a stream that is down at start, until it's up or time is over | ✅ (crabripper) |
 | Metadata rulefiles (`-w`), external metadata (`-E`), interface bind (`-I`) | ✅ |
 | Charset conversion (`--codeset-metadata`/`-id3`/`-filesys`), `--debug`, `--stderr` | ✅ |
@@ -122,8 +123,12 @@ everything crabripper reads, so it is built to fail safe:
   short tail in memory.
 - **Audio is on disk as it arrives** in every mode, so a crash or `kill`
   loses nothing already received; network errors reconnect instead of ending
-  the run. When a run stops (`-l`, Ctrl-C), the unfinished last mp3/aac frame
-  is trimmed so files end cleanly.
+  the run. When a run stops (`-l`, or Ctrl-C/SIGTERM/SIGHUP), the unfinished
+  last mp3/aac frame is trimmed so files end cleanly.
+- **Graceful stop**: the first SIGINT/SIGTERM/SIGHUP ends the run as if `-l`
+  had just run out — every stream finishes its files (frame trim, cue sheet,
+  `--wav`, last track) and exits 0. A second signal quits immediately. So
+  `kill <pid>` is the clean way to stop a recording early.
 - **Safe names**: stream titles are sanitized (no `/`, `..`, control chars),
   length-limited to fit filesystems, and never written through symlinks;
   cue sheets, logs, relay headers and the terminal never get raw control

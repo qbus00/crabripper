@@ -9,7 +9,7 @@
 use crate::url::Url;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -81,17 +81,55 @@ pub fn set_deadline(deadline: Instant) {
     }
     thread::spawn(move || {
         thread::sleep(deadline.saturating_duration_since(Instant::now()));
-        loop {
-            for (_, s) in registry()
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .iter()
-            {
-                let _ = s.shutdown(Shutdown::Both);
-            }
-            thread::sleep(Duration::from_millis(500));
-        }
+        cut_all_forever();
     });
+}
+
+// ---- graceful stop (SIGINT/SIGTERM/SIGHUP) ----
+//
+// A stop request ends the run exactly as if the -l deadline had just passed:
+// every socket is shut down so blocked reads return, the ripping loops see
+// `run_over()` and fall through to their normal finish (flush, frame trim,
+// cue sheet, --wav) instead of the process dying mid-write.
+
+static STOP: AtomicBool = AtomicBool::new(false);
+
+/// Ask every stream to finish up and end the run now.
+pub fn request_stop() {
+    if !STOP.swap(true, Ordering::SeqCst) {
+        thread::spawn(cut_all_forever);
+    }
+}
+
+/// Has a graceful stop been requested?
+pub fn stop_requested() -> bool {
+    STOP.load(Ordering::SeqCst)
+}
+
+/// Sleep for `d`, waking early if a stop is requested.
+pub fn sleep(d: Duration) {
+    let end = Instant::now() + d;
+    while !stop_requested() {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        thread::sleep(left.min(Duration::from_millis(100)));
+    }
+}
+
+/// Shut down every registered socket, and keep doing so for any opened later.
+fn cut_all_forever() {
+    loop {
+        for (_, s) in registry()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let _ = s.shutdown(Shutdown::Both);
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
 }
 
 fn deadline_passed() -> bool {
@@ -103,10 +141,8 @@ struct Watched(Option<u64>);
 
 impl Watched {
     fn new(tcp: &TcpStream) -> Watched {
+        // Always registered: a graceful stop can come with or without -l.
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        if DEADLINE.get().is_none() {
-            return Watched(None);
-        }
         match tcp.try_clone() {
             Ok(c) => {
                 let id = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -227,6 +263,9 @@ impl ServerCertVerifier for NoVerify {
 /// optionally binds the outgoing socket to a local IP, or on Linux an interface
 /// name (SO_BINDTODEVICE).
 pub fn connect(url: &Url, timeout: Duration, bind: Option<&str>, verify: bool) -> io::Result<Conn> {
+    if stop_requested() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "stop requested"));
+    }
     if deadline_passed() {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,

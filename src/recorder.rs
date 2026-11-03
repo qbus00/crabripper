@@ -299,12 +299,14 @@ impl Recorder {
             return Ok(());
         }
 
+        // `_2`... keeps parallel streams' same-titled tracks apart.
+        let sfx = &self.track_suffix;
         let base = sanitize(title);
-        let fallback = format!("track_{:03}", self.seen);
+        let fallback = format!("track_{:03}{sfx}", self.seen);
         let base = if base.is_empty() {
             fallback.clone()
         } else {
-            base
+            format!("{base}{sfx}")
         };
         // A track file that cannot be created (odd filesystem limits, a stale
         // file) costs that track's file, never the whole recording.
@@ -1016,6 +1018,52 @@ mod tests {
         r.finish().unwrap();
         assert!(dir.join("Show.mp3").exists());
         assert!(!dir.join("incomplete").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Parallel streams in one directory: same-titled tracks (and the
+    /// untitled first track) get distinct names; show names get `_2` before
+    /// the extension.
+    #[test]
+    fn parallel_streams_never_share_files() {
+        let dir = tmpdir("parallel");
+        let one = Config {
+            single_file: true,
+            single_file_name: Some("show.mp3".into()),
+            ..cfg(&dir)
+        };
+        let two = Config {
+            name_suffix: "_2".into(),
+            track_suffix: "_2".into(),
+            ..one.clone()
+        };
+        let mut a = Recorder::new(&one, "s", "mp3", 64, false).unwrap();
+        let mut b = Recorder::new(&two, "s", "mp3", 64, false).unwrap();
+        for r in [&mut a, &mut b] {
+            r.on_title("A - B").unwrap();
+            r.write_audio(&MP3[..3000]).unwrap();
+        }
+        let inc = dir.join("incomplete");
+        assert!(inc.join("A - B.mp3").exists() && inc.join("A - B_2.mp3").exists());
+        a.finish().unwrap();
+        b.finish().unwrap();
+        // A stream that never sends a title: its audio is saved at finish
+        // under the fallback name, which must differ per stream too.
+        let mut c = Recorder::new(&one, "s", "mp3", 64, false).unwrap();
+        let mut d = Recorder::new(&two, "s", "mp3", 64, false).unwrap();
+        for r in [&mut c, &mut d] {
+            r.write_audio(&MP3[..3000]).unwrap();
+            r.finish().unwrap();
+        }
+        let names: Vec<String> = fs::read_dir(&inc)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("track_"))
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names.iter().any(|n| n.ends_with("_2.mp3")), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains(" (")), "{names:?}");
+        assert!(dir.join("show.mp3").exists() && dir.join("show_2.mp3").exists());
         fs::remove_dir_all(&dir).ok();
     }
 

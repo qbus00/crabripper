@@ -44,6 +44,8 @@ fn main() {
 
     // The -l clock starts now (connecting counts), and arms the watchdog that
     // cuts every socket once the run time is over — shared by all streams.
+    install_stop_signals();
+
     let start = Instant::now();
     let deadline = cfg
         .length
@@ -93,6 +95,32 @@ fn main() {
     }
 }
 
+/// SIGINT / SIGTERM / SIGHUP: the first stops the run gracefully (every
+/// stream finishes its files as at the -l end time); a second quits at once.
+fn install_stop_signals() {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let mut signals = match signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("  ! cannot install signal handlers ({e}); a signal will stop at once");
+            return;
+        }
+    };
+    std::thread::spawn(move || {
+        let mut first = true;
+        for sig in signals.forever() {
+            if first {
+                first = false;
+                eprintln!("signal {sig}: stopping — finishing files (signal again to quit now)");
+                conn::request_stop();
+            } else {
+                eprintln!("signal {sig}: quitting now");
+                std::process::exit(128 + sig);
+            }
+        }
+    });
+}
+
 fn run(cfg: &Config, start: Instant, deadline: Option<Instant>) -> Result<(), String> {
     let say = |m: &str| {
         if !cfg.quiet {
@@ -124,6 +152,9 @@ fn run(cfg: &Config, start: Instant, deadline: Option<Instant>) -> Result<(), St
         match http::open_stream(&cfg.url, cfg) {
             Ok(opened) => break opened,
             Err(e) => {
+                if conn::stop_requested() {
+                    return Err("stopped before the stream started".to_string());
+                }
                 let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
                 if left.is_some_and(|l| l.is_zero()) {
                     return Err(format!(
@@ -140,7 +171,7 @@ fn run(cfg: &Config, start: Instant, deadline: Option<Instant>) -> Result<(), St
                     wait.as_secs()
                 );
                 last_err = Some(e);
-                std::thread::sleep(wait.min(left));
+                conn::sleep(wait.min(left));
                 wait = (wait * 2).min(Duration::from_secs(30));
             }
         }
@@ -237,7 +268,9 @@ fn run(cfg: &Config, start: Instant, deadline: Option<Instant>) -> Result<(), St
 
     let max_bytes = cfg.max_megabytes.map(|m| m.saturating_mul(1024 * 1024));
     let expired = |total: u64| {
-        deadline.is_some_and(|d| Instant::now() >= d) || max_bytes.is_some_and(|mb| total >= mb)
+        deadline.is_some_and(|d| Instant::now() >= d)
+            || conn::stop_requested()
+            || max_bytes.is_some_and(|mb| total >= mb)
     };
 
     let mut total: u64 = 0;
@@ -252,7 +285,7 @@ fn run(cfg: &Config, start: Instant, deadline: Option<Instant>) -> Result<(), St
                     break;
                 }
                 say("stream dropped — reconnecting in 2s ...");
-                std::thread::sleep(Duration::from_secs(2));
+                conn::sleep(Duration::from_secs(2));
                 match http::open_stream(&cfg.url, cfg) {
                     // The new connection may use a different metadata interval.
                     Ok((b, i)) => (source::Source::new(b), i.metaint),

@@ -9,11 +9,12 @@
 use crate::cli::{Config, HlsVariant};
 use crate::conn;
 use crate::http::{self, Limits};
+use crate::recorder::{file_name, part_path, refuse_symlink};
 use crate::util::{now_stamp, printable, sanitize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const PLAYLIST: Limits = Limits {
@@ -72,13 +73,7 @@ pub fn rip(url: &str, cfg: &Config, deadline: Option<Instant>) -> Result<(), Str
         "[hls file] {}",
         printable(&path.display().to_string())
     ));
-    if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(format!(
-            "refusing to write through a symlink: {}",
-            printable(&path.display().to_string())
-        ));
-    }
-    let mut file = File::create(&path).map_err(|e| e.to_string())?;
+    let mut out = Output::create(path)?;
 
     let expired = || deadline.is_some_and(|d| Instant::now() >= d) || conn::stop_requested();
     // Sleep `secs`, but never past the deadline.
@@ -95,6 +90,7 @@ pub fn rip(url: &str, cfg: &Config, deadline: Option<Instant>) -> Result<(), Str
     let mut total: u64 = 0;
     let mut nsegs: u64 = 0;
     let mut skipped: u64 = 0;
+    let mut last_seq: Option<u64> = None; // media sequence of the last segment written
 
     loop {
         if expired() {
@@ -148,8 +144,8 @@ pub fn rip(url: &str, cfg: &Config, deadline: Option<Instant>) -> Result<(), Str
                         .ok_or_else(|| "AES-128 decryption failed".to_string())
                 }
             });
-            let out = match seg {
-                Ok(out) => out,
+            let seg = match seg {
+                Ok(seg) => seg,
                 Err(e) => {
                     if expired() {
                         break;
@@ -159,8 +155,20 @@ pub fn rip(url: &str, cfg: &Config, deadline: Option<Instant>) -> Result<(), Str
                     continue;
                 }
             };
-            file.write_all(&out).map_err(|e| e.to_string())?;
-            total += out.len() as u64;
+            // Segments missing before this one (skipped, or gone from the
+            // playlist before we got them — a long outage) or a restarted
+            // sequence: the audio has a hole, so continue in the next part.
+            if let Some(last) = last_seq.filter(|&l| entry.seq != l.wrapping_add(1)) {
+                let why = if entry.seq > last {
+                    format!("{} HLS segment(s) missing", entry.seq - last - 1)
+                } else {
+                    "HLS media sequence restarted".to_string()
+                };
+                out.split(&why)?;
+            }
+            last_seq = Some(entry.seq);
+            out.file.write_all(&seg).map_err(|e| e.to_string())?;
+            total += seg.len() as u64;
             nsegs += 1;
             got_new = true;
         }
@@ -184,13 +192,63 @@ pub fn rip(url: &str, cfg: &Config, deadline: Option<Instant>) -> Result<(), Str
         ));
     }
 
-    file.flush().map_err(|e| e.to_string())?;
+    out.file.flush().map_err(|e| e.to_string())?;
     say(&format!(
         "done ({:.0}s, {nsegs} segments, {} KB).",
         start.elapsed().as_secs_f64(),
         total / 1024
     ));
     Ok(())
+}
+
+/// The output file. A hole in the audio splits it like a dropped Icecast
+/// stream: `X.aac` becomes `X_c1.aac` and recording goes on in `X_c2.aac`
+/// (then `_c3`...). Never written through a symlink.
+struct Output {
+    base: PathBuf,
+    path: PathBuf,
+    file: File,
+    part: u32, // 0 until the first split
+}
+
+impl Output {
+    fn create(path: PathBuf) -> Result<Self, String> {
+        let file = Self::open(&path)?;
+        Ok(Output {
+            base: path.clone(),
+            path,
+            file,
+            part: 0,
+        })
+    }
+
+    fn open(path: &Path) -> Result<File, String> {
+        refuse_symlink(path).map_err(|e| e.to_string())?;
+        File::create(path).map_err(|e| e.to_string())
+    }
+
+    fn split(&mut self, why: &str) -> Result<(), String> {
+        self.file.flush().map_err(|e| e.to_string())?;
+        let done = if self.part == 0 {
+            self.part = 1;
+            let first = part_path(&self.base, 1);
+            refuse_symlink(&first).map_err(|e| e.to_string())?;
+            fs::rename(&self.path, &first).map_err(|e| e.to_string())?;
+            first
+        } else {
+            self.path.clone()
+        };
+        self.part += 1;
+        let next = part_path(&self.base, self.part);
+        self.file = Self::open(&next)?;
+        self.path = next;
+        crate::elog!(
+            "  ! {why}: {} -> continuing in {}",
+            file_name(&done),
+            file_name(&self.path)
+        );
+        Ok(())
+    }
 }
 
 /// Fetch a 16-byte AES key. With certificate checks on, a key referenced from

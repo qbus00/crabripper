@@ -131,7 +131,11 @@ fn run(cfg: &Config, start: Instant, deadline: Option<Instant>) -> Result<(), St
     if cfg.debug {
         elog!(
             "[debug] url={} ua={:?} timeout={}s reconnect={} ssl_verify={}",
-            cfg.url, cfg.user_agent, cfg.timeout, !cfg.no_reconnect, cfg.ssl_verify
+            cfg.url,
+            cfg.user_agent,
+            cfg.timeout,
+            !cfg.no_reconnect,
+            cfg.ssl_verify
         );
     }
     if cfg.codeset_relay.is_some() {
@@ -254,6 +258,11 @@ fn run(cfg: &Config, start: Instant, deadline: Option<Instant>) -> Result<(), St
     let mut rec =
         recorder::Recorder::new(cfg, &info.name, &ext, info.bitrate.unwrap_or(128), no_split)
             .map_err(|e| e.to_string())?;
+    // The stream was down when the recording was due to start: note how much
+    // of the beginning is missing.
+    if let Some(why) = &last_err {
+        rec.mark_late_start(start.elapsed(), why);
+    }
 
     // -E external metadata source (overrides ICY metadata when present). Held
     // for the whole run; dropping it kills the command.
@@ -288,7 +297,10 @@ fn run(cfg: &Config, start: Instant, deadline: Option<Instant>) -> Result<(), St
                 conn::sleep(Duration::from_secs(2));
                 match http::open_stream(&cfg.url, cfg) {
                     // The new connection may use a different metadata interval.
-                    Ok((b, i)) => (source::Source::new(b), i.metaint),
+                    Ok((b, i)) => {
+                        rec.mark_resume().map_err(|e| e.to_string())?;
+                        (source::Source::new(b), i.metaint)
+                    }
                     Err(e) => {
                         elog!("  ! reconnect failed: {}", printable(&e));
                         continue;
@@ -300,10 +312,11 @@ fn run(cfg: &Config, start: Instant, deadline: Option<Instant>) -> Result<(), St
             cfg, metaint, &ext, &mut rec, &relay, &mut total, &expired, &mut src, ext_rx,
         )? {
             StopReason::Done => break,
-            StopReason::Disconnected => {
+            StopReason::Disconnected(why) => {
                 if cfg.no_reconnect || expired(total) {
                     break;
                 }
+                rec.mark_drop(&why);
             }
         }
     }
@@ -319,9 +332,11 @@ fn run(cfg: &Config, start: Instant, deadline: Option<Instant>) -> Result<(), St
 }
 
 enum StopReason {
-    Done,         // -l / -M reached — stop for good
-    Disconnected, // stream ended, dropped or errored — reconnect unless -c
+    Done,                 // -l / -M reached — stop for good
+    Disconnected(String), // stream ended, dropped or errored (why) — reconnect unless -c
 }
+
+const ENDED: &str = "stream ended by the server";
 
 /// One connection's worth of ripping. Returns why it stopped. Network errors
 /// end the connection (and trigger a reconnect); only local errors (disk) are
@@ -349,11 +364,9 @@ fn rip_stream(
         if expired(total) {
             return StopReason::Done;
         }
-        say(&format!(
-            "  ! connection error: {}",
-            printable(&e.to_string())
-        ));
-        StopReason::Disconnected
+        let why = format!("connection error: {}", printable(&e.to_string()));
+        say(&format!("  ! {why}"));
+        StopReason::Disconnected(why)
     };
     let mut audio = Vec::new();
 
@@ -366,7 +379,7 @@ fn rip_stream(
             }
             match src.read_some(&mut audio) {
                 Ok(true) => {}
-                Ok(false) => return Ok(StopReason::Disconnected),
+                Ok(false) => return Ok(StopReason::Disconnected(ENDED.into())),
                 Err(e) => return Ok(lost(e, *total)),
             }
             *total += audio.len() as u64;
@@ -400,20 +413,20 @@ fn rip_stream(
             }
             match full {
                 Ok(true) => {}
-                Ok(false) => return Ok(StopReason::Disconnected),
+                Ok(false) => return Ok(StopReason::Disconnected(ENDED.into())),
                 Err(e) => return Ok(lost(e, *total)),
             }
             drain_external(ext_meta, cfg, rec, relay)?;
             let len_byte = match src.read_byte() {
                 Ok(Some(b)) => b,
-                Ok(None) => return Ok(StopReason::Disconnected),
+                Ok(None) => return Ok(StopReason::Disconnected(ENDED.into())),
                 Err(e) => return Ok(lost(e, *total)),
             };
             let meta_len = len_byte as usize * 16;
             if meta_len > 0 {
                 match src.read_exact_n(meta_len, &mut meta) {
                     Ok(true) => {}
-                    Ok(false) => return Ok(StopReason::Disconnected),
+                    Ok(false) => return Ok(StopReason::Disconnected(ENDED.into())),
                     Err(e) => return Ok(lost(e, *total)),
                 }
                 // ICY metadata — skipped when an external source (-E) is driving.
@@ -439,7 +452,7 @@ fn rip_stream(
             }
             match src.read_some(&mut audio) {
                 Ok(true) => {}
-                Ok(false) => return Ok(StopReason::Disconnected),
+                Ok(false) => return Ok(StopReason::Disconnected(ENDED.into())),
                 Err(e) => return Ok(lost(e, *total)),
             }
             *total += audio.len() as u64;

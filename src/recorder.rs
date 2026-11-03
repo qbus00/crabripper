@@ -99,6 +99,14 @@ pub struct Recorder {
     ring: Vec<u8>, // tail of the current track's audio
 
     tail: Vec<u8>, // last stream bytes (mp3/aac), to trim an unfinished frame
+
+    // Connection drops split the show file: `X.mp3` becomes `X_c1.mp3` and the
+    // recording continues in `X_c2.mp3` (then `_c3`...). The cue sheet `X.cue`
+    // lists every part (one FILE block each).
+    show_base: Option<PathBuf>, // the show file's own name, `X.mp3`
+    show_part: u32,             // 0 until the first split, then the current part
+    cue_done: Vec<(String, Vec<(String, u64)>)>, // finished parts: file name, entries
+    drop_at: Option<(Instant, u64)>, // when, show position (bytes)
 }
 
 impl Recorder {
@@ -179,6 +187,8 @@ impl Recorder {
             (None, None)
         };
 
+        let show_base = show_path.clone();
+
         Ok(Recorder {
             root,
             incomplete,
@@ -221,6 +231,10 @@ impl Recorder {
             hold,
             ring: Vec::new(),
             tail: Vec::new(),
+            show_base,
+            show_part: 0,
+            cue_done: Vec::new(),
+            drop_at: None,
         })
     }
 
@@ -275,7 +289,7 @@ impl Recorder {
         if self.show.is_some()
             && !self.no_cue
             && !title.is_empty()
-            && self.cue_entries.len() < MAX_CUE_TRACKS
+            && self.cue_count() < MAX_CUE_TRACKS
         {
             let pos = self.show_bytes.saturating_sub(carry.len() as u64);
             let sec = pos * 8 / (self.bitrate_kbps as u64 * 1000);
@@ -583,25 +597,28 @@ impl Recorder {
     }
 
     fn is_show_file(&self, p: &Path) -> bool {
-        self.show_path
-            .as_ref()
-            .is_some_and(|s| p == s || p == s.with_extension("cue"))
+        self.show_path.as_ref().is_some_and(|s| p == s)
+            || self
+                .show_base
+                .as_ref()
+                .is_some_and(|b| p == b || p == b.with_extension("cue"))
     }
 
     /// Rewrite the cue sheet for the single-file show (called as entries are
     /// added, so it survives an interrupted recording).
     fn write_cue(&self, announce: bool) -> io::Result<()> {
-        if self.no_cue || self.cue_entries.is_empty() {
+        if self.no_cue || self.cue_count() == 0 {
             return Ok(());
         }
-        if let Some(show_path) = &self.show_path {
-            let show_name = show_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("show")
-                .to_string();
-            let cue_path = show_path.with_extension("cue");
-            fs::write(&cue_path, cue::render(&show_name, &self.cue_entries))?;
+        if let (Some(base), Some(show_path)) = (&self.show_base, &self.show_path) {
+            let mut files: Vec<(String, &[(String, u64)])> = self
+                .cue_done
+                .iter()
+                .map(|(f, e)| (f.clone(), e.as_slice()))
+                .collect();
+            files.push((file_name(show_path), &self.cue_entries));
+            let cue_path = base.with_extension("cue");
+            fs::write(&cue_path, cue::render(&files))?;
             if announce {
                 crate::elog!("[cue] {}", printable(&cue_path.display().to_string()));
             }
@@ -610,6 +627,96 @@ impl Recorder {
     }
 
     // ---- crabripper extensions ----
+
+    /// The connection dropped (`why`): report where; the show file is split
+    /// when it comes back (`mark_resume`). Failed reconnects keep the first drop.
+    pub fn mark_drop(&mut self, why: &str) {
+        if self.drop_at.is_some() {
+            return;
+        }
+        self.drop_at = Some((Instant::now(), self.show_bytes));
+        if let Some(p) = &self.show_path {
+            crate::elog!(
+                "  ! connection lost at {} of {} ({})",
+                fmt_hms(self.secs(self.show_bytes)),
+                file_name(p),
+                printable(why)
+            );
+        }
+    }
+
+    /// Reconnected after a drop: finish the current show part and continue in
+    /// the next one (`X.mp3` -> `X_c1.mp3` + `X_c2.mp3`, then `X_c3.mp3`...).
+    pub fn mark_resume(&mut self) -> io::Result<()> {
+        let Some((at, _)) = self.drop_at.take() else {
+            return Ok(());
+        };
+        let (Some(base), Some(cur)) = (self.show_base.clone(), self.show_path.clone()) else {
+            return Ok(());
+        };
+        let Some(show) = &mut self.show else {
+            return Ok(());
+        };
+        // The drop rarely lands on a frame boundary: end the part on a whole frame.
+        let cut = if self.mp3like {
+            frames::partial_tail(&self.tail, &self.ext) as u64
+        } else {
+            0
+        };
+        if cut > 0 {
+            self.show_bytes -= cut;
+            show.set_len(self.show_bytes)?;
+        }
+        show.flush()?;
+        self.tail.clear();
+        let done = if self.show_part == 0 {
+            self.show_part = 1;
+            let first = part_path(&base, 1);
+            refuse_symlink(&first)?;
+            fs::rename(&cur, &first)?;
+            first
+        } else {
+            cur
+        };
+        self.cue_done
+            .push((file_name(&done), std::mem::take(&mut self.cue_entries)));
+        self.show_part += 1;
+        let next = part_path(&base, self.show_part);
+        self.show = Some(create_show(&next)?);
+        self.show_path = Some(next.clone());
+        self.show_bytes = 0;
+        crate::elog!(
+            "  ! stream back after {}: {} -> continuing in {}",
+            fmt_dur(at.elapsed()),
+            file_name(&done),
+            file_name(&next)
+        );
+        // The song playing across the drop goes on in the new part.
+        if let Some(t) = self.cur.as_ref().filter(|t| !t.title.is_empty()) {
+            if self.cue_count() < MAX_CUE_TRACKS {
+                let title = truncate_utf8(&t.title, MAX_CUE_TITLE).to_string();
+                self.cue_entries.push((title, 0));
+            }
+        }
+        self.write_cue(false)
+    }
+
+    /// The stream was down at the scheduled start and came up `late` after it.
+    pub fn mark_late_start(&self, late: Duration, why: &str) {
+        crate::elog!(
+            "  ! started {} late (stream was down: {})",
+            fmt_dur(late),
+            printable(why)
+        );
+    }
+
+    fn secs(&self, bytes: u64) -> Duration {
+        Duration::from_secs(bytes * 8 / (self.bitrate_kbps as u64 * 1000))
+    }
+
+    fn cue_count(&self) -> usize {
+        self.cue_entries.len() + self.cue_done.iter().map(|(_, e)| e.len()).sum::<usize>()
+    }
 
     /// Reset the per-track clock and, with --log, append the title to played.log.
     fn note_title(&mut self, title: &str) {
@@ -738,7 +845,7 @@ fn wav_from_part(src: &Path, dst: &Path, ext: &str) -> Option<u64> {
     }
 }
 
-fn refuse_symlink(path: &Path) -> io::Result<()> {
+pub(crate) fn refuse_symlink(path: &Path) -> io::Result<()> {
     if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(io::Error::other(format!(
             "refusing to write through a symlink: {}",
@@ -848,6 +955,43 @@ fn apply_pattern(pattern: &str, title: &str, seqno: u32) -> String {
         }
     }
     sanitize(&out)
+}
+
+/// `X.mp3` -> `X_c<n>.mp3`: part `n` of a show split by connection drops.
+pub(crate) fn part_path(base: &Path, n: u32) -> PathBuf {
+    let stem = base
+        .file_stem()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    let mut name = stem;
+    name.push(format!("_c{n}"));
+    if let Some(ext) = base.extension() {
+        name.push(".");
+        name.push(ext);
+    }
+    base.with_file_name(name)
+}
+
+pub(crate) fn file_name(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// `H:MM:SS` position in a recording.
+fn fmt_hms(d: Duration) -> String {
+    let s = d.as_secs();
+    format!("{}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+}
+
+/// A gap length: `12s`, `3m05s`, `1h02m03s`.
+fn fmt_dur(d: Duration) -> String {
+    let s = d.as_secs();
+    match (s / 3600, s % 3600 / 60, s % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m{s:02}s"),
+        (h, m, s) => format!("{h}h{m:02}m{s:02}s"),
+    }
 }
 
 #[cfg(test)]
@@ -1003,6 +1147,65 @@ mod tests {
     }
 
     /// -A (show file only) writes no tracks, so no incomplete/ either.
+    #[test]
+    fn drop_splits_show_into_parts() {
+        let dir = tmpdir("drops");
+        let c = Config {
+            single_file: true,
+            single_file_name: Some("Show".into()),
+            no_individual: true,
+            ..cfg(&dir)
+        };
+        let mut r = Recorder::new(&c, "s", "mp3", 64, false).unwrap();
+        r.on_title("A - One").unwrap();
+        r.write_audio(&MP3[..3000]).unwrap();
+        r.mark_drop("reset");
+        r.mark_drop("refused"); // failed reconnect: still one drop
+        r.mark_resume().unwrap();
+        r.mark_resume().unwrap(); // nothing pending: no split
+        r.write_audio(&MP3[..3000]).unwrap();
+        r.on_title("B - Two").unwrap();
+        r.mark_drop("ended");
+        r.mark_resume().unwrap();
+        r.write_audio(&MP3[..3000]).unwrap();
+        r.finish().unwrap();
+        assert_eq!(
+            files(&dir),
+            ["Show.cue", "Show_c1.mp3", "Show_c2.mp3", "Show_c3.mp3"]
+        );
+        let cue = fs::read_to_string(dir.join("Show.cue")).unwrap();
+        let fl: Vec<&str> = cue.lines().filter(|l| l.starts_with("FILE")).collect();
+        assert_eq!(
+            fl,
+            [
+                "FILE \"Show_c1.mp3\" MP3",
+                "FILE \"Show_c2.mp3\" MP3",
+                "FILE \"Show_c3.mp3\" MP3"
+            ]
+        );
+        assert_eq!(cue.matches("TRACK ").count(), 4, "{cue}"); // One, One cont., Two, Two cont.
+        assert!(cue.contains("TRACK 04 AUDIO\n    TITLE \"Two\""), "{cue}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stop_while_down_does_not_split() {
+        let dir = tmpdir("dropend");
+        let c = Config {
+            single_file: true,
+            single_file_name: Some("Show".into()),
+            no_individual: true,
+            no_cue: true,
+            ..cfg(&dir)
+        };
+        let mut r = Recorder::new(&c, "s", "mp3", 64, false).unwrap();
+        r.write_audio(&MP3[..3000]).unwrap();
+        r.mark_drop("reset");
+        r.finish().unwrap();
+        assert_eq!(files(&dir), ["Show.mp3"]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn show_only_makes_no_incomplete_dir() {
         let dir = tmpdir("showonly");

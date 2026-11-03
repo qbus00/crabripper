@@ -524,7 +524,9 @@ Opts: -h             - Print this listing
       -p url         - (not supported: HTTP proxy)
       -o (always|never|larger|version) - When to write tracks in complete
       -t             - Don't overwrite tracks in incomplete
-      -c             - Don't auto-reconnect
+      -c             - Don't auto-reconnect. Without -c, a drop splits the -a
+                       file: X.mp3 -> X_c1.mp3, then X_c2.mp3, X_c3.mp3, ...
+                       (HLS: where segments are lost)
       -l length      - How long to run: seconds (3600), unit (90s/12m/2h),
                        or hh:mm[:ss] (1:30 or 1:30:00); else runs forever.
                        With -l, a stream that is down at the start is
@@ -659,15 +661,23 @@ mod tests {
         assert_eq!((s[0].url.as_str(), s[1].url.as_str()), ("u1", "u2"));
         assert_eq!(s[0].single_file_name.as_deref(), Some("Krakow.d"));
         assert_eq!(s[1].single_file_name.as_deref(), Some("Krakow_backup.d"));
-        assert_eq!((s[0].name_suffix.as_str(), s[1].name_suffix.as_str()), ("", ""));
-        assert_eq!((s[0].track_suffix.as_str(), s[1].track_suffix.as_str()), ("", "_2"));
+        assert_eq!(
+            (s[0].name_suffix.as_str(), s[1].name_suffix.as_str()),
+            ("", "")
+        );
+        assert_eq!(
+            (s[0].track_suffix.as_str(), s[1].track_suffix.as_str()),
+            ("", "_2")
+        );
     }
 
     #[test]
     fn multi_url_missing_names_get_suffixes() {
         let s = cfg(&["u1", "-a", "show", "u2", "u3"]).streams();
         assert_eq!(s.len(), 3);
-        assert!(s.iter().all(|c| c.single_file_name.as_deref() == Some("show")));
+        assert!(s
+            .iter()
+            .all(|c| c.single_file_name.as_deref() == Some("show")));
         let suf: Vec<_> = s.iter().map(|c| c.name_suffix.as_str()).collect();
         assert_eq!(suf, ["", "_2", "_3"]);
         // -a with no name at all: timestamped defaults, still suffixed

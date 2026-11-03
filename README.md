@@ -37,6 +37,7 @@ The C streamripper works well, but the Rust port gains:
 | Ogg per-track splitting (on Ogg logical-stream boundaries) | ✅ |
 | HLS AES-128 decryption (`#EXT-X-KEY`) | ✅ |
 | Auto-reconnect on stream drop (`-c` to disable) | ✅ |
+| Single file (`-a`) split at each drop: `X_c1.mp3`, `X_c2.mp3`, ... (one cue sheet for all parts); HLS split where segments are lost | ✅ (crabripper) |
 | Graceful stop on SIGINT/SIGTERM/SIGHUP (files finished as at `-l`) | ✅ (crabripper) |
 | With `-l`: retry a stream that is down at start, until it's up or time is over | ✅ (crabripper) |
 | Metadata rulefiles (`-w`), external metadata (`-E`), interface bind (`-I`) | ✅ |
@@ -123,7 +124,12 @@ everything crabripper reads, so it is built to fail safe:
   short tail in memory.
 - **Audio is on disk as it arrives** in every mode, so a crash or `kill`
   loses nothing already received; network errors reconnect instead of ending
-  the run. When a run stops (`-l`, or Ctrl-C/SIGTERM/SIGHUP), the unfinished
+  the run. With `-a`, a drop splits the show file so the gap is visible: on
+  the first reconnect `X.mp3` is renamed `X_c1.mp3` and recording goes on in
+  `X_c2.mp3` (then `X_c3.mp3`, ...); `X.cue` lists every part. A recording
+  without drops keeps its plain name. HLS splits the same way when segments
+  are lost (skipped after retries, or gone from the playlist during a long
+  outage); a short outage is caught up from the playlist and does not split. When a run stops (`-l`, or Ctrl-C/SIGTERM/SIGHUP), the unfinished
   last mp3/aac frame is trimmed so files end cleanly.
 - **Graceful stop**: the first SIGINT/SIGTERM/SIGHUP ends the run as if `-l`
   had just run out — every stream finishes its files (frame trim, cue sheet,

@@ -73,12 +73,18 @@ Upgrade with `brew upgrade crabripper`.
 ### Prebuilt binaries
 
 Each [release](https://github.com/qbus00/crabripper/releases) ships binaries for
-Apple Silicon macOS, Intel macOS, and static (musl) `x86_64`/`arm64` Linux:
+Apple Silicon macOS, Intel macOS, static (musl) `x86_64`/`arm64` Linux, and
+`x64`/`arm64` Windows:
 
 ```sh
 tar xzf crabripper-macos-arm64.tar.gz   # -> ./crabripper
 ./crabripper --version
 ```
+
+On Windows, unzip `crabripper-windows-amd64.zip` (or `-arm64` on an ARM PC) and run
+`crabripper.exe` from PowerShell or cmd. The exe is unsigned, so SmartScreen may
+ask once ("More info" -> "Run anyway"). Ctrl+C stops a recording gracefully (a
+second Ctrl+C quits at once); `-E` commands run through `cmd /C`.
 
 ## Build
 
@@ -104,13 +110,16 @@ Produces, from a Mac, with no Docker/QEMU:
 | Intel macOS | `crabripper-macos-x86_64` |
 | x86-64 Linux (static musl) | `crabripper-linux-amd64` |
 | aarch64 Linux (static musl) | `crabripper-linux-arm64` |
+| x64 Windows | `crabripper-windows-amd64.exe` |
+| arm64 Windows | `crabripper-windows-arm64.exe` |
 
 Both macOS targets build natively with Apple clang (the Intel one cross-compiles
-from Apple Silicon). The Linux targets cross-compile via
+from Apple Silicon). The Linux and Windows targets cross-compile via
 [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) (zig supplies the
 linker for the static musl target). Install once: `brew install zig && cargo install cargo-zigbuild`,
-plus `rustup target add x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl`.
-Each target also gets a `.tar.gz` (inner binary named `crabripper`) for Homebrew.
+plus `rustup target add x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-pc-windows-gnu aarch64-pc-windows-gnullvm`.
+Each macOS/Linux target also gets a `.tar.gz` (inner binary named `crabripper`) for
+Homebrew; each Windows target a `.zip` with `crabripper.exe`.
 
 ## Robustness & security
 

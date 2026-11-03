@@ -5,11 +5,14 @@
 #   dist/crabripper-macos-x86_64   (x86_64-apple-darwin, cross from Apple Silicon)
 #   dist/crabripper-linux-amd64    (x86_64-unknown-linux-musl, fully static)
 #   dist/crabripper-linux-arm64    (aarch64-unknown-linux-musl, fully static)
+#   dist/crabripper-windows-amd64.exe (x86_64-pc-windows-gnu)
+#   dist/crabripper-windows-arm64.exe (aarch64-pc-windows-gnullvm)
 #
-# Each target also gets a dist/crabripper-<label>.tar.gz whose inner binary is
-# named plain `crabripper` — the layout the Homebrew formula expects.
+# Each macOS/Linux target also gets a dist/crabripper-<label>.tar.gz whose inner
+# binary is named plain `crabripper` — the layout the Homebrew formula expects.
+# Windows targets get dist/crabripper-<label>.zip with `crabripper.exe` inside.
 #
-# The Linux targets cross-compile from macOS via cargo-zigbuild (zig supplies the
+# The Linux and Windows targets cross-compile from macOS via cargo-zigbuild (zig supplies the
 # C toolchain that ring needs), producing fully-static binaries with no Docker,
 # no QEMU and no OpenSSL. Both macOS targets build natively with Apple clang.
 #
@@ -18,7 +21,7 @@
 #   bash scripts/build-all.sh --no-gzip  # skip the .tar.gz archives
 #   bash scripts/build-all.sh --verbose  # stream tool output
 #
-# Linux targets need: rustup target add <triple>, cargo install cargo-zigbuild,
+# Linux/Windows targets need: rustup target add <triple>, cargo install cargo-zigbuild,
 # brew install zig. Missing pieces are reported (with the fix) and skipped.
 
 set -euo pipefail
@@ -48,7 +51,7 @@ RUSTUP="${CARGO%cargo}rustup"
 VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
 mkdir -p dist
 
-ui_banner "all targets  ·  v$VERSION" "macos arm64/x86_64  ·  linux amd64/arm64"
+ui_banner "all targets  ·  v$VERSION" "macos arm64/x86_64  ·  linux amd64/arm64  ·  windows amd64/arm64"
 
 # triple | dist-label | method(native|zig)
 TARGETS="
@@ -56,6 +59,8 @@ aarch64-apple-darwin|macos-arm64|native
 x86_64-apple-darwin|macos-x86_64|native
 x86_64-unknown-linux-musl|linux-amd64|zig
 aarch64-unknown-linux-musl|linux-arm64|zig
+x86_64-pc-windows-gnu|windows-amd64|zig
+aarch64-pc-windows-gnullvm|windows-arm64|zig
 "
 
 built=0
@@ -80,13 +85,22 @@ while IFS='|' read -r triple label method; do
   fi
 
   if ui_run "build-$label" "Compiling $label (release)" "$CARGO" "$sub" --release --target "$triple"; then
+    exe=""
+    [[ "$triple" == *windows* ]] && exe=".exe"
     out="dist/crabripper-$label"
-    cp "target/$triple/release/crabripper" "$out"
-    ui_ok "$out  ($(du -h "$out" | awk '{print $1}'))"
+    cp "target/$triple/release/crabripper$exe" "$out$exe"
+    ui_ok "$out$exe  ($(du -h "$out$exe" | awk '{print $1}'))"
     if [[ "$GZIP" == 1 ]]; then
-      # Archive the binary under its plain name `crabripper` (Homebrew expects it).
-      tar -C "target/$triple/release" -czf "$out.tar.gz" crabripper
-      ui_info "archived: $out.tar.gz"
+      if [[ -n "$exe" ]]; then
+        # Windows users expect a .zip holding crabripper.exe.
+        rm -f "$out.zip"
+        (cd "target/$triple/release" && zip -q -X "$ROOT/$out.zip" crabripper.exe)
+        ui_info "archived: $out.zip"
+      else
+        # Archive the binary under its plain name `crabripper` (Homebrew expects it).
+        tar -C "target/$triple/release" -czf "$out.tar.gz" crabripper
+        ui_info "archived: $out.tar.gz"
+      fi
     fi
     built=$((built + 1))
   fi
@@ -94,4 +108,4 @@ done <<EOF
 $TARGETS
 EOF
 
-ui_done "crabripper $VERSION" "$built/4 targets -> dist/"
+ui_done "crabripper $VERSION" "$built/6 targets -> dist/"

@@ -567,7 +567,7 @@ crabripper extensions:
       -C file / --config=file - Read options from a file (CLI overrides it)
       Several URLs record in parallel in one process, each to its own files,
       sharing every option (-l, -d, ...); console lines are tagged [1], [2]...
-      SIGINT/SIGTERM/SIGHUP stop gracefully (files finished as at the -l end);
+      SIGINT/SIGTERM/SIGHUP (Windows: Ctrl+C) stop gracefully (files finished as at the -l end);
       a second signal quits at once.";
     eprintln!("{u}");
 }

@@ -669,8 +669,14 @@ impl Recorder {
         }
         show.flush()?;
         self.tail.clear();
-        let done = if self.show_part == 0 {
-            self.show_part = 1;
+        let first_split = self.show_part == 0;
+        self.show_part = if first_split { 2 } else { self.show_part + 1 };
+        let next = part_path(&base, self.show_part);
+        // Open the next part, then close the current one (dropping it here)
+        // before renaming: Windows cannot rename an open file.
+        self.show = Some(create_show(&next)?);
+        self.show_path = Some(next.clone());
+        let done = if first_split {
             let first = part_path(&base, 1);
             refuse_symlink(&first)?;
             fs::rename(&cur, &first)?;
@@ -680,10 +686,6 @@ impl Recorder {
         };
         self.cue_done
             .push((file_name(&done), std::mem::take(&mut self.cue_entries)));
-        self.show_part += 1;
-        let next = part_path(&base, self.show_part);
-        self.show = Some(create_show(&next)?);
-        self.show_path = Some(next.clone());
         self.show_bytes = 0;
         crate::elog!(
             "  ! stream back after {}: {} -> continuing in {}",
@@ -912,6 +914,7 @@ fn fs_component(name: String, codeset: Option<&str>) -> OsString {
             }
             #[cfg(not(unix))]
             {
+                let _ = cs; // names are UTF-16 there: no codeset to apply
                 OsString::from(name)
             }
         }

@@ -21,11 +21,19 @@ impl Drop for External {
 }
 
 pub fn spawn(cmd: &str) -> std::io::Result<External> {
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .stdout(Stdio::piped())
-        .spawn()?;
+    #[cfg(windows)]
+    let mut command = {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(cmd);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(cmd);
+        c
+    };
+    let mut child = command.stdout(Stdio::piped()).spawn()?;
     let stdout = child.stdout.take().expect("piped stdout");
     let (tx, rx) = channel();
 

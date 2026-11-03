@@ -1,6 +1,6 @@
 [package]
 name = "crabripper"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 rust-version = "1.74"
 description = "A Rust port of streamripper: records shoutcast/icecast streams to per-track files."
@@ -33,10 +33,10 @@ cbc = { version = "0.1", features = ["alloc"] }
 encoding_rs = "0.8"  # --codeset-* charset conversion (e.g. CP1250 Polish metadata)
 regex = "1"          # -w metadata rulefiles
 socket2 = { version = "0.5", features = ["all"] }  # -I bind to interface/local IP (bind_device needs "all")
-webpki-roots = "0.26"
+webpki-roots = "0.26"  # Mozilla root certs for --ssl-verify (data only, no code)
 # SIGINT/SIGTERM/SIGHUP -> graceful stop (files finished as at the -l end time).
 # std has no signal API; this is the standard small wrapper (pulls in libc only).
-signal-hook = "0.3"  # Mozilla root certs for --ssl-verify (data only, no code)
+signal-hook = "0.3"
 
 [profile.release]
 opt-level = 3

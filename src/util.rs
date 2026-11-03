@@ -48,9 +48,27 @@ pub fn sanitize(s: &str) -> String {
         .trim()
         .to_string();
     if out.chars().all(|c| c == '.') {
-        String::new()
+        return String::new();
+    }
+    #[cfg(windows)]
+    let out = windows_safe(out);
+    out
+}
+
+/// Windows drops trailing dots/spaces from names and reserves device names
+/// (`CON`, `NUL`, `COM1`... also with an extension): avoid both.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_safe(name: String) -> String {
+    let name = name.trim_end_matches(['.', ' ']).to_string();
+    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        format!("_{name}")
     } else {
-        out
+        name
     }
 }
 
@@ -104,6 +122,16 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_reserved_names() {
+        assert_eq!(windows_safe("CON".into()), "_CON");
+        assert_eq!(windows_safe("nul.mp3".into()), "_nul.mp3");
+        assert_eq!(windows_safe("COM7".into()), "_COM7");
+        assert_eq!(windows_safe("Song.".into()), "Song");
+        assert_eq!(windows_safe("Console".into()), "Console");
+        assert_eq!(windows_safe("COMA".into()), "COMA");
+    }
 
     #[test]
     fn sanitize_rejects_traversal_and_controls() {

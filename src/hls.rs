@@ -229,19 +229,21 @@ impl Output {
 
     fn split(&mut self, why: &str) -> Result<(), String> {
         self.file.flush().map_err(|e| e.to_string())?;
-        let done = if self.part == 0 {
-            self.part = 1;
+        let first_split = self.part == 0;
+        self.part = if first_split { 2 } else { self.part + 1 };
+        let next = part_path(&self.base, self.part);
+        // Open the next part and close the current one before renaming it:
+        // Windows cannot rename an open file.
+        drop(std::mem::replace(&mut self.file, Self::open(&next)?));
+        let cur = std::mem::replace(&mut self.path, next);
+        let done = if first_split {
             let first = part_path(&self.base, 1);
             refuse_symlink(&first).map_err(|e| e.to_string())?;
-            fs::rename(&self.path, &first).map_err(|e| e.to_string())?;
+            fs::rename(&cur, &first).map_err(|e| e.to_string())?;
             first
         } else {
-            self.path.clone()
+            cur
         };
-        self.part += 1;
-        let next = part_path(&self.base, self.part);
-        self.file = Self::open(&next)?;
-        self.path = next;
         crate::elog!(
             "  ! {why}: {} -> continuing in {}",
             file_name(&done),

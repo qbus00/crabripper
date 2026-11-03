@@ -97,6 +97,7 @@ fn main() {
 
 /// SIGINT / SIGTERM / SIGHUP: the first stops the run gracefully (every
 /// stream finishes its files as at the -l end time); a second quits at once.
+#[cfg(unix)]
 fn install_stop_signals() {
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
     let mut signals = match signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP]) {
@@ -118,6 +119,35 @@ fn install_stop_signals() {
                 std::process::exit(128 + sig);
             }
         }
+    });
+}
+
+/// Windows: Ctrl+C / Ctrl+Break (SIGINT, SIGBREAK via the C runtime) and
+/// SIGTERM. The first sets a flag a watcher turns into a graceful stop; a
+/// second exits at once (signal-hook's two-stage pattern; Windows has no
+/// signal iterator).
+#[cfg(windows)]
+fn install_stop_signals() {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::flag;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let hit = Arc::new(AtomicBool::new(false));
+    for sig in [SIGINT, SIGTERM] {
+        // order matters: the exit check must see the flag of the previous signal
+        let ok = flag::register_conditional_shutdown(sig, 130, Arc::clone(&hit))
+            .and_then(|_| flag::register(sig, Arc::clone(&hit)));
+        if let Err(e) = ok {
+            eprintln!("  ! cannot install signal handlers ({e}); a signal will stop at once");
+            return;
+        }
+    }
+    std::thread::spawn(move || {
+        while !hit.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!("Ctrl+C: stopping — finishing files (Ctrl+C again to quit now)");
+        conn::request_stop();
     });
 }
 
